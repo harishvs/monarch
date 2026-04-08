@@ -13,9 +13,20 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import pytest
 import torch
+from monarch._rust_bindings.monarch_hyperactor.shape import Shape, Slice
 from monarch.actor import Actor, context, current_rank, endpoint, ProcMesh, this_host
 from monarch.config import configured
-from monarch.rdma import get_rdma_backend, is_ibverbs_available, RDMAAction, RDMABuffer
+from monarch.job import ProcessJob
+from monarch.rdma import (
+    get_rdma_backend,
+    is_ibverbs_available,
+    is_ofi_available,
+    RDMAAction,
+    RDMABuffer,
+)
+
+from isolate_in_subprocess import isolate_in_subprocess
+from scoped_state import scoped_state
 
 
 # TODO(slurye): Enable these tests in OSS once the shutdown hang issue is fixed.
@@ -27,42 +38,47 @@ needs_cuda = pytest.mark.skipif(
     reason="CUDA not available",
 )
 
-# Backend parametrization for tests that work on both ibverbs and TCP.
-# ibverbs tests are only collected when hardware is present; TCP tests always run.
+# Backend parametrization for tests that work on ibverbs, OFI, and TCP.
+# ibverbs/OFI tests are only collected when hardware is present; TCP tests always run.
 RDMA_BACKENDS = []
 if is_ibverbs_available():
     RDMA_BACKENDS.append("ibverbs")
+if is_ofi_available():
+    RDMA_BACKENDS.append("ofi")
 RDMA_BACKENDS.append("tcp")
 
 
-def rdma_backends(func):
-    """Parametrize a test on RDMA backend (ibverbs, tcp).
+def _backend_config(rdma_backend):
+    """Return a configured() context manager for the given backend."""
+    if rdma_backend == "tcp":
+        return configured(rdma_disable_ibverbs=True, rdma_disable_ofi=True)
+    elif rdma_backend == "ofi":
+        return configured(rdma_disable_ibverbs=True, rdma_allow_tcp_fallback=False)
+    else:
+        # ibverbs — disable OFI and TCP so we test the ibverbs path only
+        return configured(rdma_allow_tcp_fallback=False, rdma_disable_ofi=True)
 
-    ibverbs variant is only collected when hardware is present.
-    TCP variant sets rdma_disable_ibverbs=True so the manager
-    falls back to TCP even on RDMA-capable machines.
+
+def rdma_backends(func):
+    """Parametrize a test on RDMA backend (ibverbs, ofi, tcp).
+
+    ibverbs/ofi variants are only collected when hardware is present.
+    Each variant disables the other backends so the test exercises
+    exactly one transport path.
     """
 
     if inspect.iscoroutinefunction(func):
 
         @pytest.mark.parametrize("rdma_backend", RDMA_BACKENDS)
         async def wrapper(*args, rdma_backend, **kwargs):
-            if rdma_backend == "tcp":
-                cm = configured(rdma_disable_ibverbs=True)
-            else:
-                cm = configured(rdma_allow_tcp_fallback=False)
-            with cm:
+            with _backend_config(rdma_backend):
                 return await func(*args, **kwargs)
 
     else:
 
         @pytest.mark.parametrize("rdma_backend", RDMA_BACKENDS)
         def wrapper(*args, rdma_backend, **kwargs):
-            if rdma_backend == "tcp":
-                cm = configured(rdma_disable_ibverbs=True)
-            else:
-                cm = configured(rdma_allow_tcp_fallback=False)
-            with cm:
+            with _backend_config(rdma_backend):
                 return func(*args, **kwargs)
 
     wrapper.__name__ = func.__name__
@@ -905,3 +921,319 @@ async def test_rdma_buffer_retains_tensor_reference():
     client = client_proc.spawn("client", ClientActor)
 
     await client.check_buffer_retains_tensor.call_one()
+
+
+# ---------------------------------------------------------------------------
+# Same-node read_into regression test (GitHub issue #3376)
+# ---------------------------------------------------------------------------
+
+
+class WeightServerActor(Actor):
+    """Simulates an FSDP learner that owns model weights and exposes them via RDMA."""
+
+    def __init__(self, num_params: int):
+        super().__init__()
+        # Simulate model weights (e.g. 3GB model flattened to 1-D byte tensor)
+        self.weights = torch.arange(num_params, dtype=torch.float32)
+        self.buffer = None
+
+    @endpoint
+    async def create_weight_buffer(self) -> RDMABuffer:
+        byte_tensor = self.weights.view(torch.uint8).flatten()
+        self.buffer = RDMABuffer(byte_tensor)
+        return self.buffer
+
+    @endpoint
+    async def get_weights(self) -> torch.Tensor:
+        return self.weights
+
+    @endpoint
+    async def drop_weight_buffer(self) -> None:
+        if self.buffer is not None:
+            await self.buffer.drop()
+            self.buffer = None
+
+
+class WeightClientActor(Actor):
+    """Simulates a vLLM generator that pulls weights from the learner via RDMA."""
+
+    def __init__(self, num_params: int):
+        super().__init__()
+        self.local_weights = torch.zeros(num_params, dtype=torch.float32)
+
+    @endpoint
+    async def pull_weights(self, buffer: RDMABuffer, timeout: int = 10) -> str:
+        """Pull weights from the server's RDMABuffer into local storage.
+
+        Returns 'ok' on success or an error description on failure.
+        """
+        byte_tensor = self.local_weights.view(torch.uint8).flatten()
+        try:
+            await buffer.read_into(byte_tensor, timeout=timeout)
+        except Exception as e:
+            return f"ERROR: {e}"
+        return "ok"
+
+    @endpoint
+    async def get_local_weights(self) -> torch.Tensor:
+        return self.local_weights
+
+
+@rdma_backends
+async def test_same_node_read_into_between_separate_actors():
+    """Regression test for GitHub #3376: read_into() delivery timeout on same node.
+
+    Two actors on separate ProcMeshes (same host) exchange weight data via
+    RDMABuffer.  On EKS with EFA/ibverbs this timed out because the
+    IbvManagerActor never responded to the RequestBuffer message.
+    """
+    num_params = 1024  # small payload — the bug is in connection setup, not data size
+
+    server_proc = this_host().spawn_procs(per_host={"processes": 1})
+    client_proc = this_host().spawn_procs(per_host={"processes": 1})
+
+    server = server_proc.spawn("weight_server", WeightServerActor, num_params)
+    client = client_proc.spawn("weight_client", WeightClientActor, num_params)
+
+    # Server creates buffer and hands the handle to the client
+    buffer = await server.create_weight_buffer.call_one()
+
+    # Client pulls weights — this is the operation that times out in #3376
+    result = await client.pull_weights.call_one(buffer, timeout=30)
+    assert result == "ok", f"read_into failed on same node: {result}"
+
+    # Verify data integrity
+    expected = await server.get_weights.call_one()
+    actual = await client.get_local_weights.call_one()
+    assert torch.equal(
+        actual.view(torch.uint8).flatten(),
+        expected.view(torch.uint8).flatten(),
+    ), "Weight data mismatch after same-node read_into"
+
+    # Cleanup
+    await server.drop_weight_buffer.call_one()
+
+
+@pytest.mark.skipif(not is_ibverbs_available(), reason="ibverbs hardware not available")
+async def test_same_node_read_into_ibverbs_only():
+    """Targeted ibverbs-only variant of #3376 — no TCP fallback allowed.
+
+    Forces the ibverbs path so the test cannot accidentally pass via TCP
+    fallback on EFA nodes where ibverbs is broken for same-node transfers.
+    """
+    num_params = 2048
+
+    with configured(rdma_allow_tcp_fallback=False):
+        server_proc = this_host().spawn_procs(per_host={"processes": 1})
+        client_proc = this_host().spawn_procs(per_host={"processes": 1})
+
+        server = server_proc.spawn("ibv_server", WeightServerActor, num_params)
+        client = client_proc.spawn("ibv_client", WeightClientActor, num_params)
+
+        buffer = await server.create_weight_buffer.call_one()
+
+        # Short timeout — the bug causes infinite wait, so fail fast
+        result = await client.pull_weights.call_one(buffer, timeout=15)
+        assert result == "ok", (
+            f"ibverbs-only read_into failed on same node (issue #3376): {result}"
+        )
+
+        expected = await server.get_weights.call_one()
+        actual = await client.get_local_weights.call_one()
+        assert torch.equal(
+            actual.view(torch.uint8).flatten(),
+            expected.view(torch.uint8).flatten(),
+        ), "Weight data mismatch after ibverbs-only same-node read_into"
+
+        await server.drop_weight_buffer.call_one()
+
+
+# ---------------------------------------------------------------------------
+# Cross-node read_into test (GitHub issue #3376 — verify fix doesn't break
+# the cross-node path that already works)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.timeout(120)
+@isolate_in_subprocess
+def test_cross_node_read_into_between_hosts():
+    """Cross-node RDMA read_into between actors on separate virtual hosts.
+
+    Uses ProcessJob({"hosts": 2}) to spawn two subprocess-based hosts,
+    then creates a WeightServer on host 0 and a WeightClient on host 1.
+    This exercises the cross-node handshake path (manager_actor.rs:683-742)
+    where is_loopback is correctly false and ibv_create_ah() targets a
+    genuinely remote GID.
+
+    Ensures any fix for #3376 (same-node loopback detection) does not
+    regress the cross-node transfer path.
+    """
+    import asyncio
+
+    async def _run():
+        num_params = 1024
+
+        with scoped_state(ProcessJob({"hosts": 2}), cached_path=None) as state:
+            hosts = state.hosts
+
+            # Host 0: server that owns the weights
+            host0 = hosts._new_with_shape(
+                Shape(labels=["hosts"], slice=Slice(offset=0, sizes=[1], strides=[1]))
+            )
+            server_proc = host0.spawn_procs(per_host={"processes": 1}, name="server_procs")
+            server = server_proc.spawn("weight_server", WeightServerActor, num_params)
+
+            # Host 1: client that pulls weights via RDMA
+            host1 = hosts._new_with_shape(
+                Shape(labels=["hosts"], slice=Slice(offset=1, sizes=[1], strides=[1]))
+            )
+            client_proc = host1.spawn_procs(per_host={"processes": 1}, name="client_procs")
+            client = client_proc.spawn("weight_client", WeightClientActor, num_params)
+
+            # Server creates buffer, client pulls via read_into
+            buffer = await server.create_weight_buffer.call_one()
+            result = await client.pull_weights.call_one(buffer, timeout=30)
+            assert result == "ok", f"Cross-node read_into failed: {result}"
+
+            # Verify data integrity
+            expected = await server.get_weights.call_one()
+            actual = await client.get_local_weights.call_one()
+            assert torch.equal(
+                actual.view(torch.uint8).flatten(),
+                expected.view(torch.uint8).flatten(),
+            ), "Weight data mismatch after cross-node read_into"
+
+            await server.drop_weight_buffer.call_one()
+
+    asyncio.run(_run())
+
+
+@pytest.mark.timeout(120)
+@pytest.mark.skipif(not is_ibverbs_available(), reason="ibverbs hardware not available")
+@isolate_in_subprocess
+def test_cross_node_read_into_ibverbs_only():
+    """Cross-node ibverbs-only variant — no TCP fallback.
+
+    Confirms the ibverbs cross-node handshake (QP init → connection_info
+    exchange → connect → AH creation with remote GID) works when actors
+    are on genuinely different hosts. This path should be unaffected by
+    any same-node loopback fix for #3376.
+    """
+    import asyncio
+
+    async def _run():
+        num_params = 2048
+
+        with configured(rdma_allow_tcp_fallback=False):
+            with scoped_state(ProcessJob({"hosts": 2}), cached_path=None) as state:
+                hosts = state.hosts
+
+                host0 = hosts._new_with_shape(
+                    Shape(labels=["hosts"], slice=Slice(offset=0, sizes=[1], strides=[1]))
+                )
+                server_proc = host0.spawn_procs(
+                    per_host={"processes": 1}, name="ibv_server_procs"
+                )
+                server = server_proc.spawn(
+                    "ibv_weight_server", WeightServerActor, num_params
+                )
+
+                host1 = hosts._new_with_shape(
+                    Shape(labels=["hosts"], slice=Slice(offset=1, sizes=[1], strides=[1]))
+                )
+                client_proc = host1.spawn_procs(
+                    per_host={"processes": 1}, name="ibv_client_procs"
+                )
+                client = client_proc.spawn(
+                    "ibv_weight_client", WeightClientActor, num_params
+                )
+
+                buffer = await server.create_weight_buffer.call_one()
+                result = await client.pull_weights.call_one(buffer, timeout=15)
+                assert result == "ok", (
+                    f"ibverbs-only cross-node read_into failed: {result}"
+                )
+
+                expected = await server.get_weights.call_one()
+                actual = await client.get_local_weights.call_one()
+                assert torch.equal(
+                    actual.view(torch.uint8).flatten(),
+                    expected.view(torch.uint8).flatten(),
+                ), "Weight data mismatch after ibverbs-only cross-node read_into"
+
+                await server.drop_weight_buffer.call_one()
+
+    asyncio.run(_run())
+
+
+# ---------------------------------------------------------------------------
+# Same-actor loopback test (is_loopback = true path in manager_actor.rs:666)
+# ---------------------------------------------------------------------------
+
+
+class LoopbackActor(Actor):
+    """Actor that creates an RDMABuffer and reads it back itself (loopback)."""
+
+    def __init__(self, num_params: int):
+        super().__init__()
+        self.source = torch.arange(num_params, dtype=torch.float32)
+        self.dest = torch.zeros(num_params, dtype=torch.float32)
+
+    @endpoint
+    async def loopback_read_into(self, timeout: int = 10) -> str:
+        """Create buffer from source, read_into dest on the same actor."""
+        byte_src = self.source.view(torch.uint8).flatten()
+        byte_dst = self.dest.view(torch.uint8).flatten()
+        buf = RDMABuffer(byte_src)
+        try:
+            await buf.read_into(byte_dst, timeout=timeout)
+        except Exception as e:
+            return f"ERROR: {e}"
+        return "ok"
+
+    @endpoint
+    async def loopback_write_from(self, timeout: int = 10) -> str:
+        """Create buffer from dest, write source into it on the same actor."""
+        byte_src = self.source.view(torch.uint8).flatten()
+        byte_dst = self.dest.view(torch.uint8).flatten()
+        buf = RDMABuffer(byte_dst)
+        try:
+            await buf.write_from(byte_src, timeout=timeout)
+        except Exception as e:
+            return f"ERROR: {e}"
+        return "ok"
+
+    @endpoint
+    async def verify(self) -> bool:
+        return torch.equal(self.source, self.dest)
+
+
+@rdma_backends
+async def test_same_actor_same_device_loopback_read_into():
+    """Test the loopback path: same actor creates buffer and reads it back.
+
+    This exercises manager_actor.rs:666-682 where is_loopback=true
+    (other_id == self_ref.actor_id() && self_device == other_device).
+    The simplified loopback path avoids cross-device AH creation entirely.
+    """
+    proc = this_host().spawn_procs(per_host={"processes": 1})
+    actor = proc.spawn("loopback", LoopbackActor, 512)
+
+    result = await actor.loopback_read_into.call_one(timeout=15)
+    assert result == "ok", f"Loopback read_into failed: {result}"
+
+    match = await actor.verify.call_one()
+    assert match, "Data mismatch after loopback read_into"
+
+
+@rdma_backends
+async def test_same_actor_same_device_loopback_write_from():
+    """Test the loopback path with write_from: same actor writes into its own buffer."""
+    proc = this_host().spawn_procs(per_host={"processes": 1})
+    actor = proc.spawn("loopback_w", LoopbackActor, 512)
+
+    result = await actor.loopback_write_from.call_one(timeout=15)
+    assert result == "ok", f"Loopback write_from failed: {result}"
+
+    match = await actor.verify.call_one()
+    assert match, "Data mismatch after loopback write_from"

@@ -53,4 +53,14 @@ declare_attrs! {
         Some("rdma_tcp_fallback_parallelism".to_string()),
     ))
     pub attr RDMA_TCP_FALLBACK_PARALLELISM: usize = 1;
+
+    /// Disable the OFI (libfabric) backend even when available.
+    ///
+    /// When true, `RdmaManagerActor` skips OFI initialization.
+    /// Only relevant when built with the `ofi` feature.
+    @meta(CONFIG = ConfigAttr::new(
+        Some("MONARCH_RDMA_DISABLE_OFI".to_string()),
+        Some("rdma_disable_ofi".to_string()),
+    ))
+    pub attr RDMA_DISABLE_OFI: bool = false;
 }

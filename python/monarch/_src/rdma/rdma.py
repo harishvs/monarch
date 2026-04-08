@@ -26,6 +26,7 @@ try:
         _RdmaBuffer,
         _RdmaManager,
         is_ibverbs_available as _is_ibverbs_available,
+        is_ofi_available as _is_ofi_available,
         rdma_supported as _rdma_supported,
     )
 except ImportError as e:
@@ -65,6 +66,16 @@ def is_ibverbs_available() -> bool:
     return _is_ibverbs_available()
 
 
+def is_ofi_available() -> bool:
+    """Whether the OFI (libfabric) RDMA backend is available on this system.
+
+    When True, the OFI backend can be used for RDMA transfers. On EFA
+    hardware, the libfabric EFA provider transparently handles same-node
+    transfers via shared memory.
+    """
+    return _is_ofi_available()
+
+
 def is_rdma_available() -> bool:
     """Whether RDMA over ibverbs is available on this system.
 
@@ -88,12 +99,17 @@ def get_rdma_backend() -> str:
     """Return available RDMA backend.
 
     Returns:
-        str: One of 'ibverbs', 'tcp', or 'none' indicating the available backend.
-             Both Mellanox and EFA hardware are accessed through ibverbs.
-             'tcp' indicates the TCP fallback transport is enabled.
+        str: One of 'ibverbs', 'ofi', 'tcp', or 'none' indicating the
+             available backend.
+             'ibverbs' — Mellanox or EFA via raw ibverbs.
+             'ofi' — libfabric (handles same-node EFA via SHM).
+             'tcp' — TCP fallback transport.
     """
     if _is_ibverbs_available():
         return "ibverbs"
+
+    if _is_ofi_available():
+        return "ofi"
 
     if _rdma_supported():
         return "tcp"

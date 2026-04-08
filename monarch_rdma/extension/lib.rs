@@ -387,6 +387,13 @@ fn rdma_supported_py() -> bool {
     rdma_supported()
 }
 
+/// Whether the OFI (libfabric) backend is available on this system.
+#[pyfunction]
+#[pyo3(name = "is_ofi_available")]
+fn is_ofi_available_py() -> bool {
+    monarch_rdma::ofi_supported()
+}
+
 pub fn register_python_bindings(module: &Bound<'_, PyModule>) -> PyResult<()> {
     // Register the PyTorch segment scanner callback.
     // This calls torch.cuda.memory._snapshot() to get CUDA memory segments.
@@ -401,5 +408,6 @@ pub fn register_python_bindings(module: &Bound<'_, PyModule>) -> PyResult<()> {
         is_ibverbs_available_py
     );
     py_module_add_function!(module, "monarch._rust_bindings.rdma", rdma_supported_py);
+    py_module_add_function!(module, "monarch._rust_bindings.rdma", is_ofi_available_py);
     Ok(())
 }

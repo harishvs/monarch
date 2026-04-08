@@ -49,6 +49,10 @@ use crate::backend::RdmaRemoteBackendContext;
 use crate::backend::ibverbs::manager_actor::IbvManagerActor;
 use crate::backend::ibverbs::manager_actor::IbvManagerMessageClient;
 use crate::backend::ibverbs::primitives::IbvConfig;
+#[cfg(feature = "ofi")]
+use crate::backend::ofi::manager_actor::OfiManagerActor;
+#[cfg(feature = "ofi")]
+use crate::backend::ofi::manager_actor::OfiManagerMessageClient;
 use crate::backend::tcp::manager_actor::TcpManagerActor;
 use crate::local_memory::RdmaLocalMemory;
 use crate::rdma_components::RdmaRemoteBuffer;
@@ -113,6 +117,17 @@ pub struct GetTcpActorRef {
 }
 wirevalue::register_type!(GetTcpActorRef);
 
+/// Serializable query for resolving the [`OfiManagerActor`] ref
+/// from a remote [`RdmaManagerActor`].
+#[cfg(feature = "ofi")]
+#[derive(Handler, HandleClient, RefClient, Debug, Serialize, Deserialize, Named)]
+pub struct GetOfiActorRef {
+    #[reply]
+    pub reply: reference::OncePortRef<Option<reference::ActorRef<OfiManagerActor>>>,
+}
+#[cfg(feature = "ofi")]
+wirevalue::register_type!(GetOfiActorRef);
+
 #[derive(Debug)]
 enum RdmaBackendActor<A: Actor> {
     Uninit,
@@ -148,6 +163,8 @@ impl<A: Actor> RdmaBackendActor<A> {
     handlers = [
         GetIbvActorRef,
         GetTcpActorRef,
+        #[cfg(feature = "ofi")]
+        GetOfiActorRef,
         ReleaseBuffer,
     ],
 )]
@@ -155,6 +172,8 @@ pub struct RdmaManagerActor {
     next_remote_buf_id: usize,
     buffers: HashMap<usize, Arc<dyn RdmaLocalMemory>>,
     ibverbs: Option<RdmaBackendActor<IbvManagerActor>>,
+    #[cfg(feature = "ofi")]
+    ofi: Option<RdmaBackendActor<OfiManagerActor>>,
     tcp: RdmaBackendActor<TcpManagerActor>,
 }
 
@@ -203,12 +222,28 @@ impl RemoteSpawn for RdmaManagerActor {
             }
         };
 
+        #[cfg(feature = "ofi")]
+        let ofi = if !hyperactor_config::global::get(crate::config::RDMA_DISABLE_OFI) {
+            match OfiManagerActor::new(None) {
+                Ok(actor) => Some(RdmaBackendActor::Created(actor)),
+                Err(e) => {
+                    tracing::info!("OFI initialization skipped: {}", e);
+                    None
+                }
+            }
+        } else {
+            tracing::info!("OFI disabled by configuration");
+            None
+        };
+
         let tcp = RdmaBackendActor::Created(TcpManagerActor::new());
 
         Ok(Self {
             next_remote_buf_id: 0,
             buffers: HashMap::new(),
             ibverbs: ibv,
+            #[cfg(feature = "ofi")]
+            ofi,
             tcp,
         })
     }
@@ -219,6 +254,10 @@ impl Actor for RdmaManagerActor {
     async fn init(&mut self, this: &Instance<Self>) -> Result<(), anyhow::Error> {
         if let Some(ibv) = &mut self.ibverbs {
             ibv.spawn(this)?;
+        }
+        #[cfg(feature = "ofi")]
+        if let Some(ofi) = &mut self.ofi {
+            ofi.spawn(this)?;
         }
         self.tcp.spawn(this)?;
         tracing::debug!("RdmaManagerActor initialized with lazy domain/QP creation");
@@ -261,6 +300,18 @@ impl GetTcpActorRefHandler for RdmaManagerActor {
     }
 }
 
+#[cfg(feature = "ofi")]
+#[async_trait]
+#[hyperactor::handle(GetOfiActorRef)]
+impl GetOfiActorRefHandler for RdmaManagerActor {
+    async fn get_ofi_actor_ref(
+        &mut self,
+        _cx: &Context<Self>,
+    ) -> Result<Option<reference::ActorRef<OfiManagerActor>>, anyhow::Error> {
+        Ok(self.ofi.as_ref().map(|ofi| ofi.handle().bind()))
+    }
+}
+
 #[async_trait]
 #[hyperactor::handle(ReleaseBuffer)]
 impl ReleaseBufferHandler for RdmaManagerActor {
@@ -268,6 +319,10 @@ impl ReleaseBufferHandler for RdmaManagerActor {
         self.buffers.remove(&id);
         if let Some(ibv) = &self.ibverbs {
             ibv.handle().release_buffer(cx, id).await?;
+        }
+        #[cfg(feature = "ofi")]
+        if let Some(ofi) = &self.ofi {
+            ofi.handle().release_buffer(cx, id).await?;
         }
         Ok(())
     }
@@ -294,6 +349,11 @@ impl RdmaManagerMessageHandler for RdmaManagerActor {
                 ibv.handle().bind(),
                 Arc::new(OnceCell::new()),
             ));
+        }
+
+        #[cfg(feature = "ofi")]
+        if let Some(ofi) = &self.ofi {
+            backends.push(RdmaRemoteBackendContext::Ofi(ofi.handle().bind()));
         }
 
         backends.push(RdmaRemoteBackendContext::Tcp(self.tcp.handle().bind()));

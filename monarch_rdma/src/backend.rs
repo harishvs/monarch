@@ -11,6 +11,8 @@
 #[cfg(test)]
 pub(crate) mod cuda_test_utils;
 pub mod ibverbs;
+#[cfg(feature = "ofi")]
+pub mod ofi;
 pub mod tcp;
 
 use std::fmt::Debug;
@@ -41,6 +43,8 @@ pub enum RdmaRemoteBackendContext {
         Arc<OnceCell<ibverbs::IbvBuffer>>,
     ),
     Tcp(reference::ActorRef<tcp::manager_actor::TcpManagerActor>),
+    #[cfg(feature = "ofi")]
+    Ofi(reference::ActorRef<ofi::manager_actor::OfiManagerActor>),
 }
 
 impl Serialize for RdmaRemoteBackendContext {
@@ -54,6 +58,13 @@ impl Serialize for RdmaRemoteBackendContext {
                 "Tcp",
                 actor_ref,
             ),
+            #[cfg(feature = "ofi")]
+            RdmaRemoteBackendContext::Ofi(actor_ref) => serializer.serialize_newtype_variant(
+                "RdmaRemoteBackendContext",
+                2,
+                "Ofi",
+                actor_ref,
+            ),
         }
     }
 }
@@ -65,6 +76,8 @@ impl<'de> Deserialize<'de> for RdmaRemoteBackendContext {
         enum Repr {
             Ibverbs(reference::ActorRef<ibverbs::manager_actor::IbvManagerActor>),
             Tcp(reference::ActorRef<tcp::manager_actor::TcpManagerActor>),
+            #[cfg(feature = "ofi")]
+            Ofi(reference::ActorRef<ofi::manager_actor::OfiManagerActor>),
         }
 
         match Repr::deserialize(deserializer)? {
@@ -73,6 +86,8 @@ impl<'de> Deserialize<'de> for RdmaRemoteBackendContext {
                 Arc::new(OnceCell::new()),
             )),
             Repr::Tcp(actor_ref) => Ok(RdmaRemoteBackendContext::Tcp(actor_ref)),
+            #[cfg(feature = "ofi")]
+            Repr::Ofi(actor_ref) => Ok(RdmaRemoteBackendContext::Ofi(actor_ref)),
         }
     }
 }
