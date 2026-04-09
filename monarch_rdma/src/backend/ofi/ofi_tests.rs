@@ -220,16 +220,33 @@ mod tests {
         let dst_mr = register_cpu_mr(&ep2, &domain, dst_buf.as_mut_ptr() as usize, buf_size, 2);
 
         let mut ctx: libfabric_sys::fi_context2 = unsafe { std::mem::zeroed() };
-        ep1.write(
-            src_buf.as_ptr() as u64,
-            buf_size,
-            src_mr.desc(),
-            dst_buf.as_ptr() as u64,
-            dst_mr.rkey,
-            fi_addr2_on_ep1,
-            &mut ctx as *mut _ as *mut std::ffi::c_void,
-        )
-        .expect("fi_write failed");
+
+        // Retry fi_write — EFA RDM may need internal handshake time
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let ret = ep1.write(
+                src_buf.as_ptr() as u64,
+                buf_size,
+                src_mr.desc(),
+                dst_buf.as_ptr() as u64,
+                dst_mr.rkey,
+                fi_addr2_on_ep1,
+                &mut ctx as *mut _ as *mut std::ffi::c_void,
+            );
+            match ret {
+                Ok(()) => break,
+                Err(e) if format!("{}", e).contains("-11") && std::time::Instant::now() < deadline => {
+                    // Drive CQ progress on shared domain to let provider process internal messages
+                    let mut dummy: libfabric_sys::fi_cq_data_entry = unsafe { std::mem::zeroed() };
+                    unsafe {
+                        libfabric_sys::libfabric_sys_fi_cq_read(domain.cq, &mut dummy as *mut _ as *mut _, 1);
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                    continue;
+                }
+                Err(e) => panic!("fi_write failed after retries: {}", e),
+            }
+        }
 
         ep1.poll_cq(&domain, Duration::from_secs(10))
             .expect("CQ poll timed out or errored");
@@ -266,16 +283,31 @@ mod tests {
         let remote_mr = register_cpu_mr(&ep2, &domain, remote_buf.as_mut_ptr() as usize, buf_size, 2);
 
         let mut ctx: libfabric_sys::fi_context2 = unsafe { std::mem::zeroed() };
-        ep1.read(
-            local_buf.as_mut_ptr() as u64,
-            buf_size,
-            local_mr.desc(),
-            remote_buf.as_ptr() as u64,
-            remote_mr.rkey,
-            fi_addr2_on_ep1,
-            &mut ctx as *mut _ as *mut std::ffi::c_void,
-        )
-        .expect("fi_read failed");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let ret = ep1.read(
+                local_buf.as_mut_ptr() as u64,
+                buf_size,
+                local_mr.desc(),
+                remote_buf.as_ptr() as u64,
+                remote_mr.rkey,
+                fi_addr2_on_ep1,
+                &mut ctx as *mut _ as *mut std::ffi::c_void,
+            );
+            match ret {
+                Ok(()) => break,
+                Err(e) if format!("{}", e).contains("-11") && std::time::Instant::now() < deadline => {
+                    let mut dummy: libfabric_sys::fi_cq_data_entry = unsafe { std::mem::zeroed() };
+                    unsafe {
+                        libfabric_sys::libfabric_sys_fi_cq_read(domain.cq, &mut dummy as *mut _ as *mut _, 1);
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                    continue;
+                }
+                Err(e) => panic!("fi_read failed after retries: {}", e),
+            }
+        }
 
         ep1.poll_cq(&domain, Duration::from_secs(10))
             .expect("CQ poll timed out or errored");
