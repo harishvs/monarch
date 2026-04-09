@@ -59,8 +59,13 @@ impl OfiDomain {
     /// If the provider does not support HMEM, falls back to CPU-only mode.
     pub fn new(config: &OfiConfig) -> Result<Self> {
         unsafe {
-            // Try with HMEM first, fall back to without
-            let (info, hmem_supported) = Self::get_info_with_hmem_fallback(config)?;
+            // Try with HMEM first (if requested), fall back to without
+            let (info, hmem_supported) = if config.request_hmem {
+                Self::get_info_with_hmem_fallback(config)?
+            } else {
+                let info = Self::call_fi_getinfo(config, false)?;
+                (info, false)
+            };
 
             // fi_fabric
             let mut fabric: *mut libfabric_sys::fid_fabric = ptr::null_mut();
