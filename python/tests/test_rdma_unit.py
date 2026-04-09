@@ -86,7 +86,7 @@ import pytest
 import torch
 from monarch.actor import Actor, context, endpoint, ProcMesh, this_host
 from monarch.config import configured
-from monarch.rdma import is_ibverbs_available, RDMABuffer
+from monarch.rdma import is_ibverbs_available, is_ofi_available, RDMABuffer
 
 
 # TODO(slurye): Enable these tests in OSS once the shutdown hang issue is fixed.
@@ -114,11 +114,13 @@ needs_cuda = pytest.mark.skipif(
     reason="CUDA not available",
 )
 
-# Backend parametrization: ibverbs only collected when hardware is present;
-# TCP always runs.
+# Backend parametrization: ibverbs/OFI only collected when hardware is present;
+# TCP always runs.  OFI tests auto-skip on non-EFA runners via is_ofi_available().
 RDMA_BACKENDS = []
 if is_ibverbs_available():
     RDMA_BACKENDS.append("ibverbs")
+if is_ofi_available():
+    RDMA_BACKENDS.append("ofi")
 RDMA_BACKENDS.append("tcp")
 
 
@@ -540,13 +542,21 @@ CONTROLLER_DEVICES = ["cpu"]
 RECEIVER_DEVICES = ["cpu"]
 
 
+def _backend_config(rdma_backend):
+    """Return a configured() context manager that isolates the given backend."""
+    if rdma_backend == "tcp":
+        return configured(rdma_disable_ibverbs=True, rdma_disable_ofi=True)
+    elif rdma_backend == "ofi":
+        return configured(rdma_disable_ibverbs=True, rdma_allow_tcp_fallback=False)
+    else:
+        # ibverbs — disable OFI and TCP so we test the ibverbs path only
+        return configured(rdma_allow_tcp_fallback=False, rdma_disable_ofi=True)
+
+
 async def _do_test(
     func, dtype, data_getter, controller_device, receiver_device, rdma_backend
 ):
-    if rdma_backend == "tcp":
-        cm = configured(rdma_disable_ibverbs=True)
-    else:
-        cm = configured(rdma_allow_tcp_fallback=False)
+    cm = _backend_config(rdma_backend)
     with cm:
         controller, receiver = await _spawn_controller_and_receiver(
             controller_device=controller_device,

@@ -9,4 +9,5 @@ description = "Raw FFI bindings to libfabric (OFI) for RDMA transport"
 
 [build-dependencies]
 bindgen = "0.70.1"
+cc = "1"
 pkg-config = "0.3"

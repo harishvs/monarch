@@ -30,6 +30,23 @@ mod tests {
         }
     }
 
+    /// Register a CPU MR, using the HMEM path when the domain requires it.
+    fn register_cpu_mr(
+        ep: &OfiEndpoint,
+        domain: &OfiDomain,
+        addr: usize,
+        size: usize,
+        key: u64,
+    ) -> super::super::endpoint::OfiMr {
+        if domain.hmem_supported {
+            ep.register_mr_hmem(domain, addr, size, key, libfabric_sys::fi_hmem_iface_FI_HMEM_SYSTEM, 0)
+                .expect("register_mr_hmem (SYSTEM) failed")
+        } else {
+            ep.register_mr(domain, addr, size, key)
+                .expect("register_mr failed")
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Phase 2: Primitive unit tests
     // -----------------------------------------------------------------------
@@ -207,16 +224,9 @@ mod tests {
             .av_insert(&domain2, &info1)
             .expect("av_insert failed");
 
-        // Register MRs:
-        // - src_buf on ep1 as local MR (for writing from)
-        // - dst_buf on ep2 as remote MR (for writing to)
-        let src_mr = ep1
-            .register_mr(&domain1, src_buf.as_mut_ptr() as usize, buf_size, 1)
-            .expect("src MR registration failed");
-
-        let dst_mr = ep2
-            .register_mr(&domain2, dst_buf.as_mut_ptr() as usize, buf_size, 2)
-            .expect("dst MR registration failed");
+        // Register MRs (HMEM-aware: uses fi_mr_regattr even for CPU when needed)
+        let src_mr = register_cpu_mr(&ep1, &domain1, src_buf.as_mut_ptr() as usize, buf_size, 1);
+        let dst_mr = register_cpu_mr(&ep2, &domain2, dst_buf.as_mut_ptr() as usize, buf_size, 2);
 
         let remote_key = dst_mr.rkey;
         let remote_addr = dst_buf.as_ptr() as u64;
@@ -276,16 +286,10 @@ mod tests {
             .av_insert(&domain2, &info1)
             .expect("av_insert failed");
 
-        // Register MRs:
-        // - remote_buf on ep2 (data source, remote side)
-        // - local_buf on ep1 (data destination, local side)
-        let local_mr = ep1
-            .register_mr(&domain1, local_buf.as_mut_ptr() as usize, buf_size, 1)
-            .expect("local MR registration failed");
+        // Register MRs (HMEM-aware)
+        let local_mr = register_cpu_mr(&ep1, &domain1, local_buf.as_mut_ptr() as usize, buf_size, 1);
 
-        let remote_mr = ep2
-            .register_mr(&domain2, remote_buf.as_mut_ptr() as usize, buf_size, 2)
-            .expect("remote MR registration failed");
+        let remote_mr = register_cpu_mr(&ep2, &domain2, remote_buf.as_mut_ptr() as usize, buf_size, 2);
 
         let remote_key = remote_mr.rkey;
         let remote_addr = remote_buf.as_ptr() as u64;
@@ -311,5 +315,184 @@ mod tests {
             local_buf, remote_buf,
             "local buffer should match remote after RDMA read"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 5: GPU (CUDA) HMEM tests
+    // -----------------------------------------------------------------------
+
+    /// Returns true (skip) if OFI or CUDA is unavailable.
+    fn skip_if_no_gpu_ofi() -> bool {
+        if skip_if_no_ofi() {
+            return true;
+        }
+        let cuda_ok = unsafe {
+            rdmaxcel_sys::rdmaxcel_cuInit(0) == rdmaxcel_sys::CUDA_SUCCESS
+        };
+        if !cuda_ok {
+            eprintln!("Skipping test: CUDA not available");
+            return true;
+        }
+        false
+    }
+
+    #[test]
+    fn test_ofi_gpu_mr_registration() {
+        if skip_if_no_gpu_ofi() {
+            return;
+        }
+
+        let config = OfiConfig::default();
+        let domain = OfiDomain::new(&config).expect("domain creation failed");
+        if !domain.hmem_supported {
+            eprintln!("Skipping: provider does not support FI_HMEM");
+            return;
+        }
+        let endpoint = OfiEndpoint::new(&domain).expect("endpoint creation failed");
+
+        let allocator = crate::backend::cuda_test_utils::CudaAllocator::get();
+        let gpu_buf = allocator.allocate(0, 4096);
+
+        let mr = endpoint
+            .register_mr_hmem(
+                &domain,
+                gpu_buf.ptr(),
+                gpu_buf.size(),
+                1,
+                libfabric_sys::fi_hmem_iface_FI_HMEM_CUDA,
+                0,
+            )
+            .expect("register_mr_hmem should succeed");
+
+        assert!(!mr.mr.is_null(), "MR handle should be non-null");
+    }
+
+    #[test]
+    fn test_ofi_gpu_write_roundtrip() {
+        if skip_if_no_gpu_ofi() {
+            return;
+        }
+
+        let config = OfiConfig::default();
+        let buf_size = 4096;
+
+        let domain1 = OfiDomain::new(&config).expect("domain1 failed");
+        if !domain1.hmem_supported {
+            eprintln!("Skipping: provider does not support FI_HMEM");
+            return;
+        }
+        let ep1 = OfiEndpoint::new(&domain1).expect("ep1 failed");
+        let domain2 = OfiDomain::new(&config).expect("domain2 failed");
+        let ep2 = OfiEndpoint::new(&domain2).expect("ep2 failed");
+
+        let allocator = crate::backend::cuda_test_utils::CudaAllocator::get();
+        let src_gpu = allocator.allocate(0, buf_size);
+        let dst_gpu = allocator.allocate(0, buf_size);
+
+        // Fill source with pattern
+        let src_data = vec![42u8; buf_size];
+        unsafe {
+            rdmaxcel_sys::rdmaxcel_cuMemcpyHtoD_v2(
+                src_gpu.ptr() as rdmaxcel_sys::CUdeviceptr,
+                src_data.as_ptr() as *const _,
+                src_data.len(),
+            );
+        }
+
+        // Exchange addresses
+        let info1 = ep1.get_name().expect("get_name ep1 failed");
+        let info2 = ep2.get_name().expect("get_name ep2 failed");
+        let fi_addr2 = ep1.av_insert(&domain1, &info2).expect("av_insert failed");
+        let _fi_addr1 = ep2.av_insert(&domain2, &info1).expect("av_insert failed");
+
+        let src_mr = ep1
+            .register_mr_hmem(&domain1, src_gpu.ptr(), src_gpu.size(), 1, libfabric_sys::fi_hmem_iface_FI_HMEM_CUDA, 0)
+            .expect("src MR failed");
+        let dst_mr = ep2
+            .register_mr_hmem(&domain2, dst_gpu.ptr(), dst_gpu.size(), 2, libfabric_sys::fi_hmem_iface_FI_HMEM_CUDA, 0)
+            .expect("dst MR failed");
+
+        ep1.write(
+            src_gpu.ptr() as u64, buf_size, src_mr.desc(),
+            dst_gpu.ptr() as u64, dst_mr.rkey, fi_addr2,
+            std::ptr::null_mut(),
+        ).expect("fi_write failed");
+
+        ep1.poll_cq(&domain1, Duration::from_secs(10))
+            .expect("CQ poll failed");
+
+        let mut result = vec![0u8; buf_size];
+        unsafe {
+            rdmaxcel_sys::rdmaxcel_cuMemcpyDtoH_v2(
+                result.as_mut_ptr() as *mut _,
+                dst_gpu.ptr() as rdmaxcel_sys::CUdeviceptr,
+                result.len(),
+            );
+        }
+        assert_eq!(result, src_data, "GPU dst should match src after RDMA write");
+    }
+
+    #[test]
+    fn test_ofi_gpu_read_roundtrip() {
+        if skip_if_no_gpu_ofi() {
+            return;
+        }
+
+        let config = OfiConfig::default();
+        let buf_size = 4096;
+
+        let domain1 = OfiDomain::new(&config).expect("domain1 failed");
+        if !domain1.hmem_supported {
+            eprintln!("Skipping: provider does not support FI_HMEM");
+            return;
+        }
+        let ep1 = OfiEndpoint::new(&domain1).expect("ep1 failed");
+        let domain2 = OfiDomain::new(&config).expect("domain2 failed");
+        let ep2 = OfiEndpoint::new(&domain2).expect("ep2 failed");
+
+        let allocator = crate::backend::cuda_test_utils::CudaAllocator::get();
+        let remote_gpu = allocator.allocate(0, buf_size);
+        let local_gpu = allocator.allocate(0, buf_size);
+
+        // Fill remote with pattern
+        let remote_data = vec![99u8; buf_size];
+        unsafe {
+            rdmaxcel_sys::rdmaxcel_cuMemcpyHtoD_v2(
+                remote_gpu.ptr() as rdmaxcel_sys::CUdeviceptr,
+                remote_data.as_ptr() as *const _,
+                remote_data.len(),
+            );
+        }
+
+        let info1 = ep1.get_name().expect("get_name ep1 failed");
+        let info2 = ep2.get_name().expect("get_name ep2 failed");
+        let fi_addr2 = ep1.av_insert(&domain1, &info2).expect("av_insert failed");
+        let _fi_addr1 = ep2.av_insert(&domain2, &info1).expect("av_insert failed");
+
+        let local_mr = ep1
+            .register_mr_hmem(&domain1, local_gpu.ptr(), local_gpu.size(), 1, libfabric_sys::fi_hmem_iface_FI_HMEM_CUDA, 0)
+            .expect("local MR failed");
+        let remote_mr = ep2
+            .register_mr_hmem(&domain2, remote_gpu.ptr(), remote_gpu.size(), 2, libfabric_sys::fi_hmem_iface_FI_HMEM_CUDA, 0)
+            .expect("remote MR failed");
+
+        ep1.read(
+            local_gpu.ptr() as u64, buf_size, local_mr.desc(),
+            remote_gpu.ptr() as u64, remote_mr.rkey, fi_addr2,
+            std::ptr::null_mut(),
+        ).expect("fi_read failed");
+
+        ep1.poll_cq(&domain1, Duration::from_secs(10))
+            .expect("CQ poll failed");
+
+        let mut result = vec![0u8; buf_size];
+        unsafe {
+            rdmaxcel_sys::rdmaxcel_cuMemcpyDtoH_v2(
+                result.as_mut_ptr() as *mut _,
+                local_gpu.ptr() as rdmaxcel_sys::CUdeviceptr,
+                result.len(),
+            );
+        }
+        assert_eq!(result, remote_data, "GPU local should match remote after RDMA read");
     }
 }

@@ -131,6 +131,7 @@ impl RdmaRemoteBuffer {
         // Prefer ibverbs when available on both sides
         if self.has_ibverbs_backend() {
             if let Ok(ibv_handle) = IbvManagerActor::local_handle(client).await {
+                tracing::debug!("choose_backend: selected ibverbs");
                 return Ok(RdmaLocalBackend::Ibv(IbvBackend(ibv_handle)));
             }
         }
@@ -139,6 +140,7 @@ impl RdmaRemoteBuffer {
         #[cfg(feature = "ofi")]
         if self.has_ofi_backend() {
             if let Ok(ofi_handle) = OfiManagerActor::local_handle(client).await {
+                tracing::debug!("choose_backend: selected OFI");
                 return Ok(RdmaLocalBackend::Ofi(OfiBackend(ofi_handle)));
             }
         }
@@ -152,6 +154,7 @@ impl RdmaRemoteBuffer {
                 self.owner.actor_id()
             )
         };
+        tracing::debug!("choose_backend: falling back to TCP ({})", reason);
         self.tcp_fallback_or_bail(&reason, client).await
     }
 

@@ -12,7 +12,8 @@
 //! 1. pkg-config (preferred)
 //! 2. Common install paths (/opt/amazon/efa, /usr/local, /usr)
 //!
-//! Generates Rust FFI bindings using bindgen.
+//! Compiles `wrapper.c` (plain-C wrappers for static-inline libfabric
+//! functions) and generates Rust FFI bindings using bindgen.
 
 use std::env;
 use std::path::PathBuf;
@@ -26,6 +27,7 @@ const SEARCH_PATHS: &[&str] = &[
 
 fn main() {
     println!("cargo:rerun-if-changed=wrapper.h");
+    println!("cargo:rerun-if-changed=wrapper.c");
 
     let mut include_dir: Option<String> = None;
     let mut lib_dir: Option<String> = None;
@@ -79,12 +81,19 @@ fn main() {
     // Export include dir for downstream crates
     println!("cargo:include={}", include_dir);
 
+    // Compile wrapper.c (plain-C wrappers for static-inline functions)
+    cc::Build::new()
+        .file("wrapper.c")
+        .include(&include_dir)
+        .compile("fabric_wrapper");
+
     // Generate bindings
     let bindings = bindgen::Builder::default()
         .header("wrapper.h")
         .clang_arg(format!("-I{}", include_dir))
         // Only generate bindings for fi_* symbols and FI_* constants
         .allowlist_function("fi_.*")
+        .allowlist_function("libfabric_sys_.*")
         .allowlist_type("fi_.*")
         .allowlist_type("fid_.*")
         .allowlist_var("FI_.*")

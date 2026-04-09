@@ -158,16 +158,14 @@ impl<A: Actor> RdmaBackendActor<A> {
 }
 
 #[derive(Debug)]
-#[hyperactor::export(
+#[cfg_attr(feature = "ofi", hyperactor::export(
     spawn = true,
-    handlers = [
-        GetIbvActorRef,
-        GetTcpActorRef,
-        #[cfg(feature = "ofi")]
-        GetOfiActorRef,
-        ReleaseBuffer,
-    ],
-)]
+    handlers = [GetIbvActorRef, GetTcpActorRef, GetOfiActorRef, ReleaseBuffer],
+))]
+#[cfg_attr(not(feature = "ofi"), hyperactor::export(
+    spawn = true,
+    handlers = [GetIbvActorRef, GetTcpActorRef, ReleaseBuffer],
+))]
 pub struct RdmaManagerActor {
     next_remote_buf_id: usize,
     buffers: HashMap<usize, Arc<dyn RdmaLocalMemory>>,
@@ -235,6 +233,18 @@ impl RemoteSpawn for RdmaManagerActor {
             tracing::info!("OFI disabled by configuration");
             None
         };
+
+        // Warn if running in degraded (TCP-only) mode
+        #[cfg(feature = "ofi")]
+        let has_hw_backend = ibv.is_some() || ofi.is_some();
+        #[cfg(not(feature = "ofi"))]
+        let has_hw_backend = ibv.is_some();
+        if !has_hw_backend {
+            tracing::warn!(
+                "neither ibverbs nor OFI backend available — running in TCP-only mode \
+                 (RDMA transfers will use TCP fallback with reduced performance)"
+            );
+        }
 
         let tcp = RdmaBackendActor::Created(TcpManagerActor::new());
 
