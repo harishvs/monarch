@@ -70,6 +70,9 @@
 - Never commit secrets, API keys, or credentials. Use IRSA, environment variables, or K8s Secrets.
 - Always use `*.tfvars` in .gitignore. Provide a `.tfvars.example` with dummy values instead.
 
+## Tool Permission Requests
+- When asking the user for permission to run a tool, always include a **plain-language explanation** of what the command does and why it's needed. The user may not understand the command syntax. Example: instead of just running `cargo test -p monarch_rdma --features ofi`, say "I want to run the OFI unit tests to check if our code changes work — this compiles and executes the test suite for the RDMA module."
+
 ## Commit 
 - dont add Co-Authored-By: 
 1

@@ -25,6 +25,10 @@ pub struct OfiConfig {
     pub max_send_wr: usize,
     /// Maximum number of outstanding recv work requests.
     pub max_recv_wr: usize,
+    /// Whether to request FI_HMEM capability for GPU memory support.
+    /// When true, the domain will attempt HMEM negotiation with fallback.
+    /// Set to false for CPU-only workloads to avoid HMEM-related mode changes.
+    pub request_hmem: bool,
 }
 
 impl Default for OfiConfig {
@@ -33,6 +37,7 @@ impl Default for OfiConfig {
             provider: String::new(), // auto-detect
             max_send_wr: 128,
             max_recv_wr: 128,
+            request_hmem: true,
         }
     }
 }
