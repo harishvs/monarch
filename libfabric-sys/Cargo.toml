@@ -1,0 +1,12 @@
+[package]
+name = "libfabric-sys"
+version = "0.0.1"
+authors = ["Facebook"]
+edition = "2021"
+license = "BSD-3-Clause"
+links = "fabric"
+description = "Raw FFI bindings to libfabric (OFI) for RDMA transport"
+
+[build-dependencies]
+bindgen = "0.70.1"
+pkg-config = "0.3"

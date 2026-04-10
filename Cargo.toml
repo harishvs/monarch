@@ -30,6 +30,7 @@ members = [
     "preempt_rwlock",
     "monarch_record_batch",
     "monarch_record_batch_macros",
+    "libfabric-sys",
     "rdmaxcel-sys",
     "serde_multipart",
     "struct_diff_patch",

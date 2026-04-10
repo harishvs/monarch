@@ -1,0 +1,315 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * All rights reserved.
+ *
+ * This source code is licensed under the BSD-style license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+//! Unit tests for the OFI (libfabric) backend.
+//!
+//! All tests self-gate on `ofi_supported()` so they skip gracefully
+//! when libfabric is not installed (e.g., non-EFA CI runners).
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::super::domain::OfiDomain;
+    use super::super::endpoint::OfiEndpoint;
+    use super::super::primitives::OfiConfig;
+    use super::super::primitives::ofi_supported;
+
+    /// Skip helper — returns true if OFI is not available.
+    fn skip_if_no_ofi() -> bool {
+        if !ofi_supported() {
+            eprintln!("Skipping test: OFI (libfabric) not available");
+            true
+        } else {
+            false
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 2: Primitive unit tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ofi_domain_creation() {
+        if skip_if_no_ofi() {
+            return;
+        }
+
+        let config = OfiConfig::default();
+        let domain = OfiDomain::new(&config).expect("OfiDomain::new should succeed");
+
+        assert!(!domain.info.is_null(), "info should be non-null");
+        assert!(!domain.fabric.is_null(), "fabric should be non-null");
+        assert!(!domain.domain.is_null(), "domain should be non-null");
+        assert!(!domain.av.is_null(), "av should be non-null");
+        assert!(!domain.cq.is_null(), "cq should be non-null");
+
+        // Drop cleans up — no crash
+    }
+
+    #[test]
+    fn test_ofi_endpoint_lifecycle() {
+        if skip_if_no_ofi() {
+            return;
+        }
+
+        let config = OfiConfig::default();
+        let domain = OfiDomain::new(&config).expect("domain creation failed");
+        let endpoint = OfiEndpoint::new(&domain).expect("endpoint creation failed");
+
+        assert!(!endpoint.ep.is_null(), "endpoint should be non-null");
+
+        let info = endpoint.get_name().expect("get_name should succeed");
+        assert!(info.addr_len > 0, "endpoint address should have non-zero length");
+        assert_eq!(
+            info.addr.len(),
+            info.addr_len,
+            "addr vec length should match addr_len"
+        );
+
+        // Drop cleans up endpoint then domain — no crash
+    }
+
+    #[test]
+    fn test_ofi_cpu_mr_registration() {
+        if skip_if_no_ofi() {
+            return;
+        }
+
+        let config = OfiConfig::default();
+        let domain = OfiDomain::new(&config).expect("domain creation failed");
+        let endpoint = OfiEndpoint::new(&domain).expect("endpoint creation failed");
+
+        // Allocate a CPU buffer and register it
+        let mut buf = vec![0u8; 4096];
+        let addr = buf.as_mut_ptr() as usize;
+        let size = buf.len();
+
+        let mr = endpoint
+            .register_mr(&domain, addr, size, 1)
+            .expect("register_mr should succeed");
+
+        // rkey should be valid (non-zero for most providers, but 0 is technically
+        // valid for some — just check we got an MR handle)
+        assert!(!mr.mr.is_null(), "MR handle should be non-null");
+
+        let desc = mr.desc();
+        // desc may be null for some providers (e.g., tcp), so we only check it's callable
+        let _ = desc;
+
+        // Drop deregisters MR — no crash
+    }
+
+    #[test]
+    fn test_ofi_av_insert_roundtrip() {
+        if skip_if_no_ofi() {
+            return;
+        }
+
+        let config = OfiConfig::default();
+
+        // Create two independent domain+endpoint pairs
+        let domain1 = OfiDomain::new(&config).expect("domain1 creation failed");
+        let ep1 = OfiEndpoint::new(&domain1).expect("ep1 creation failed");
+
+        let domain2 = OfiDomain::new(&config).expect("domain2 creation failed");
+        let ep2 = OfiEndpoint::new(&domain2).expect("ep2 creation failed");
+
+        // Exchange names
+        let info1 = ep1.get_name().expect("get_name ep1 failed");
+        let info2 = ep2.get_name().expect("get_name ep2 failed");
+
+        // Insert peer addresses
+        let fi_addr_2_on_1 = ep1
+            .av_insert(&domain1, &info2)
+            .expect("av_insert of ep2 into ep1 failed");
+        let fi_addr_1_on_2 = ep2
+            .av_insert(&domain2, &info1)
+            .expect("av_insert of ep1 into ep2 failed");
+
+        // fi_addr_t should not be FI_ADDR_UNSPEC (which is typically u64::MAX)
+        assert_ne!(
+            fi_addr_2_on_1,
+            u64::MAX,
+            "fi_addr should not be FI_ADDR_UNSPEC"
+        );
+        assert_ne!(
+            fi_addr_1_on_2,
+            u64::MAX,
+            "fi_addr should not be FI_ADDR_UNSPEC"
+        );
+    }
+
+    #[test]
+    fn test_ofi_endpoint_drop_cleanup() {
+        if skip_if_no_ofi() {
+            return;
+        }
+
+        let config = OfiConfig::default();
+
+        // Create and immediately drop multiple times — verify no resource leak or crash
+        for _ in 0..5 {
+            let domain = OfiDomain::new(&config).expect("domain creation failed");
+            let ep = OfiEndpoint::new(&domain).expect("endpoint creation failed");
+
+            // Register and immediately deregister an MR
+            let mut buf = vec![0u8; 1024];
+            let mr = ep
+                .register_mr(&domain, buf.as_mut_ptr() as usize, buf.len(), 1)
+                .expect("register_mr failed");
+
+            drop(mr);
+            drop(ep);
+            drop(domain);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 3: CPU read/write round-trip tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ofi_cpu_write_roundtrip() {
+        if skip_if_no_ofi() {
+            return;
+        }
+
+        let config = OfiConfig::default();
+        let buf_size = 4096;
+
+        // Allocate two CPU buffers
+        let mut src_buf = vec![42u8; buf_size];
+        let mut dst_buf = vec![0u8; buf_size];
+
+        // Create two domain+endpoint pairs
+        let domain1 = OfiDomain::new(&config).expect("domain1 failed");
+        let ep1 = OfiEndpoint::new(&domain1).expect("ep1 failed");
+
+        let domain2 = OfiDomain::new(&config).expect("domain2 failed");
+        let ep2 = OfiEndpoint::new(&domain2).expect("ep2 failed");
+
+        // Exchange addresses
+        let info1 = ep1.get_name().expect("get_name ep1 failed");
+        let info2 = ep2.get_name().expect("get_name ep2 failed");
+
+        let fi_addr2_on_ep1 = ep1
+            .av_insert(&domain1, &info2)
+            .expect("av_insert failed");
+
+        // ep2 also needs to know ep1 for the completion to work
+        let _fi_addr1_on_ep2 = ep2
+            .av_insert(&domain2, &info1)
+            .expect("av_insert failed");
+
+        // Register MRs:
+        // - src_buf on ep1 as local MR (for writing from)
+        // - dst_buf on ep2 as remote MR (for writing to)
+        let src_mr = ep1
+            .register_mr(&domain1, src_buf.as_mut_ptr() as usize, buf_size, 1)
+            .expect("src MR registration failed");
+
+        let dst_mr = ep2
+            .register_mr(&domain2, dst_buf.as_mut_ptr() as usize, buf_size, 2)
+            .expect("dst MR registration failed");
+
+        let remote_key = dst_mr.rkey;
+        let remote_addr = dst_buf.as_ptr() as u64;
+
+        // Perform RDMA write: ep1 writes src_buf into dst_buf (on ep2)
+        ep1.write(
+            src_buf.as_ptr() as u64,
+            buf_size,
+            src_mr.desc(),
+            remote_addr,
+            remote_key,
+            fi_addr2_on_ep1,
+            std::ptr::null_mut(),
+        )
+        .expect("fi_write failed");
+
+        // Poll CQ on ep1 for write completion
+        ep1.poll_cq(&domain1, Duration::from_secs(10))
+            .expect("CQ poll timed out or errored");
+
+        // Verify data was written
+        assert_eq!(
+            dst_buf, src_buf,
+            "destination buffer should match source after RDMA write"
+        );
+    }
+
+    #[test]
+    fn test_ofi_cpu_read_roundtrip() {
+        if skip_if_no_ofi() {
+            return;
+        }
+
+        let config = OfiConfig::default();
+        let buf_size = 4096;
+
+        // Allocate two CPU buffers: remote has the data, local receives it
+        let mut remote_buf = vec![99u8; buf_size];
+        let mut local_buf = vec![0u8; buf_size];
+
+        // Create two domain+endpoint pairs
+        let domain1 = OfiDomain::new(&config).expect("domain1 failed");
+        let ep1 = OfiEndpoint::new(&domain1).expect("ep1 failed");
+
+        let domain2 = OfiDomain::new(&config).expect("domain2 failed");
+        let ep2 = OfiEndpoint::new(&domain2).expect("ep2 failed");
+
+        // Exchange addresses
+        let info1 = ep1.get_name().expect("get_name ep1 failed");
+        let info2 = ep2.get_name().expect("get_name ep2 failed");
+
+        let fi_addr2_on_ep1 = ep1
+            .av_insert(&domain1, &info2)
+            .expect("av_insert failed");
+
+        let _fi_addr1_on_ep2 = ep2
+            .av_insert(&domain2, &info1)
+            .expect("av_insert failed");
+
+        // Register MRs:
+        // - remote_buf on ep2 (data source, remote side)
+        // - local_buf on ep1 (data destination, local side)
+        let local_mr = ep1
+            .register_mr(&domain1, local_buf.as_mut_ptr() as usize, buf_size, 1)
+            .expect("local MR registration failed");
+
+        let remote_mr = ep2
+            .register_mr(&domain2, remote_buf.as_mut_ptr() as usize, buf_size, 2)
+            .expect("remote MR registration failed");
+
+        let remote_key = remote_mr.rkey;
+        let remote_addr = remote_buf.as_ptr() as u64;
+
+        // Perform RDMA read: ep1 reads remote_buf (on ep2) into local_buf
+        ep1.read(
+            local_buf.as_mut_ptr() as u64,
+            buf_size,
+            local_mr.desc(),
+            remote_addr,
+            remote_key,
+            fi_addr2_on_ep1,
+            std::ptr::null_mut(),
+        )
+        .expect("fi_read failed");
+
+        // Poll CQ on ep1 for read completion
+        ep1.poll_cq(&domain1, Duration::from_secs(10))
+            .expect("CQ poll timed out or errored");
+
+        // Verify data was read
+        assert_eq!(
+            local_buf, remote_buf,
+            "local buffer should match remote after RDMA read"
+        );
+    }
+}

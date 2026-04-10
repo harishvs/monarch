@@ -27,13 +27,29 @@ mod rdma_components;
 mod rdma_manager_actor;
 
 pub use backend::ibverbs::primitives::*;
+#[cfg(feature = "ofi")]
+pub use backend::ofi;
 
 /// Whether any RDMA backend is available on this system.
 ///
-/// Returns true if ibverbs hardware is present, or if TCP fallback
-/// is enabled via [`config::RDMA_ALLOW_TCP_FALLBACK`].
+/// Returns true if ibverbs hardware is present, OFI is available,
+/// or TCP fallback is enabled via [`config::RDMA_ALLOW_TCP_FALLBACK`].
 pub fn rdma_supported() -> bool {
-    ibverbs_supported() || hyperactor_config::global::get(config::RDMA_ALLOW_TCP_FALLBACK)
+    ibverbs_supported()
+        || ofi_supported()
+        || hyperactor_config::global::get(config::RDMA_ALLOW_TCP_FALLBACK)
+}
+
+/// Whether the OFI (libfabric) backend is available.
+pub fn ofi_supported() -> bool {
+    #[cfg(feature = "ofi")]
+    {
+        backend::ofi::primitives::ofi_supported()
+    }
+    #[cfg(not(feature = "ofi"))]
+    {
+        false
+    }
 }
 pub use rdma_components::RdmaRemoteBuffer;
 pub use rdma_components::SegmentScannerFn;

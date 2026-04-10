@@ -63,6 +63,14 @@ use crate::backend::ibverbs::IbvBuffer;
 use crate::backend::ibverbs::manager_actor::IbvBackend;
 use crate::backend::ibverbs::manager_actor::IbvManagerActor;
 use crate::backend::ibverbs::manager_actor::IbvManagerMessageClient;
+#[cfg(feature = "ofi")]
+use crate::backend::ofi::OfiBuffer;
+#[cfg(feature = "ofi")]
+use crate::backend::ofi::manager_actor::OfiBackend;
+#[cfg(feature = "ofi")]
+use crate::backend::ofi::manager_actor::OfiManagerActor;
+#[cfg(feature = "ofi")]
+use crate::backend::ofi::manager_actor::OfiManagerMessageClient;
 use crate::backend::tcp::manager_actor::TcpBackend;
 use crate::backend::tcp::manager_actor::TcpManagerActor;
 use crate::local_memory::RdmaLocalMemory;
@@ -88,6 +96,8 @@ wirevalue::register_type!(RdmaRemoteBuffer);
 #[derive(Debug)]
 pub enum RdmaLocalBackend {
     Ibv(IbvBackend),
+    #[cfg(feature = "ofi")]
+    Ofi(OfiBackend),
     Tcp(TcpBackend),
 }
 
@@ -100,6 +110,8 @@ impl RdmaLocalBackend {
     ) -> Result<(), anyhow::Error> {
         match self {
             RdmaLocalBackend::Ibv(h) => h.submit(cx, ops, timeout).await,
+            #[cfg(feature = "ofi")]
+            RdmaLocalBackend::Ofi(h) => h.submit(cx, ops, timeout).await,
             RdmaLocalBackend::Tcp(h) => h.submit(cx, ops, timeout).await,
         }
     }
@@ -116,24 +128,31 @@ impl RdmaRemoteBuffer {
         &self,
         client: &(impl context::Actor + Send + Sync),
     ) -> Result<RdmaLocalBackend, anyhow::Error> {
+        // Prefer ibverbs when available on both sides
         if self.has_ibverbs_backend() {
             if let Ok(ibv_handle) = IbvManagerActor::local_handle(client).await {
                 return Ok(RdmaLocalBackend::Ibv(IbvBackend(ibv_handle)));
             }
-
-            return self
-                .tcp_fallback_or_bail("no ibverbs backend on the local side", client)
-                .await;
         }
 
-        self.tcp_fallback_or_bail(
-            &format!(
-                "no ibverbs backend on the remote side (owner={})",
+        // Try OFI when available (handles same-node EFA via SHM transparently)
+        #[cfg(feature = "ofi")]
+        if self.has_ofi_backend() {
+            if let Ok(ofi_handle) = OfiManagerActor::local_handle(client).await {
+                return Ok(RdmaLocalBackend::Ofi(OfiBackend(ofi_handle)));
+            }
+        }
+
+        // Fall back to TCP
+        let reason = if self.has_ibverbs_backend() {
+            "no ibverbs or OFI backend on the local side".to_string()
+        } else {
+            format!(
+                "no ibverbs or OFI backend on the remote side (owner={})",
                 self.owner.actor_id()
-            ),
-            client,
-        )
-        .await
+            )
+        };
+        self.tcp_fallback_or_bail(&reason, client).await
     }
 
     /// Push data from local memory into this remote buffer (local->remote).
@@ -211,6 +230,39 @@ impl RdmaRemoteBuffer {
         self.backends
             .iter()
             .any(|b| matches!(b, RdmaRemoteBackendContext::Ibverbs(..)))
+    }
+
+    /// Whether this buffer has an OFI backend context.
+    #[cfg(feature = "ofi")]
+    fn has_ofi_backend(&self) -> bool {
+        self.backends
+            .iter()
+            .any(|b| matches!(b, RdmaRemoteBackendContext::Ofi(..)))
+    }
+
+    /// Resolve the OFI backend context for this buffer.
+    ///
+    /// Lazily requests the remote [`OfiBuffer`] from the remote
+    /// [`OfiManagerActor`] on first access.
+    #[cfg(feature = "ofi")]
+    pub async fn resolve_ofi(
+        &self,
+        client: &impl context::Actor,
+    ) -> Option<Result<(reference::ActorRef<OfiManagerActor>, OfiBuffer), anyhow::Error>> {
+        let remote_ofi_mgr = self.backends.iter().find_map(|b| match b {
+            RdmaRemoteBackendContext::Ofi(mgr) => Some(mgr),
+            _ => None,
+        })?;
+
+        Some(
+            remote_ofi_mgr
+                .request_buffer(client, self.id)
+                .await
+                .and_then(|opt| {
+                    opt.ok_or_else(|| anyhow::anyhow!("OFI buffer {} not found", self.id))
+                })
+                .map(|buf| (remote_ofi_mgr.clone(), buf)),
+        )
     }
 
     /// Resolve the ibverbs backend context for this buffer.

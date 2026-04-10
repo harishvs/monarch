@@ -79,3 +79,13 @@ pub fn mr_access_flags() -> rdmaxcel_sys::ibv_access_flags {
         | rdmaxcel_sys::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE
         | rdmaxcel_sys::ibv_access_flags::IBV_ACCESS_REMOTE_READ
 }
+
+/// Whether the EFA provider is available via libfabric (OFI).
+///
+/// Returns true if `fi_getinfo(provider="efa")` succeeds. This indicates
+/// that libfabric is installed and the EFA provider can be used for RDMA,
+/// including transparent same-node SHM routing.
+#[cfg(feature = "ofi")]
+pub fn is_efa_ofi_available() -> bool {
+    libfabric_sys::efa_ofi_available()
+}

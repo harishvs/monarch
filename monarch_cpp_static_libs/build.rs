@@ -195,6 +195,10 @@ fn build_rdma_core(rdma_core_dir: &Path) -> PathBuf {
         "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
         "-DCMAKE_C_FLAGS=-fPIC",
         "-DCMAKE_CXX_FLAGS=-fPIC",
+        // Use a short install prefix so IBACM_SERVER_PATH fits in
+        // struct sockaddr_un.sun_path (108 bytes max). Long build
+        // paths (e.g., cargo target dirs) would otherwise exceed it.
+        "-DCMAKE_INSTALL_PREFIX=/tmp/rdma-core",
     ];
 
     if ninja_cmd.is_some() {
