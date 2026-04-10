@@ -9,7 +9,8 @@ actor messaging. It provides:
    and failures propagate up the tree, providing good default error behavior and
    enabling fine-grained fault recovery.
 3. Point-to-point RDMA transfers: cheap registration of any GPU or CPU memory in
-   a process, with the one-sided transfers based on libibverbs
+   a process, with one-sided transfers via libibverbs (InfiniBand/RoCE) or
+   libfabric/OFI (AWS EFA with automatic same-node shared memory)
 4. Distributed tensors: actors can work with tensor objects sharded across
    processes
 
@@ -145,6 +146,8 @@ sudo dnf install clang-devel libnccl-devel libstdc++-static
 
 # Install RDMA libraries (needed for tensor_engine builds)
 sudo dnf install -y libibverbs rdma-core libmlx5 libibverbs-devel rdma-core-devel
+# For AWS EFA: install libfabric (enables OFI backend with same-node SHM support)
+# sudo dnf install -y libfabric libfabric-devel  # or use the EFA installer from AWS
 
 # Clone and sync dependencies
 git clone https://github.com/meta-pytorch/monarch.git
@@ -184,6 +187,8 @@ sudo apt install -y cuda-toolkit-12-8 cuda-12-8
 
 # Install RDMA libraries (needed for tensor_engine builds)
 sudo apt install -y rdma-core libibverbs1 libmlx5-1 libibverbs-dev
+# For AWS EFA: install libfabric (enables OFI backend with same-node SHM support)
+# sudo apt install -y libfabric1 libfabric-dev  # or use the EFA installer from AWS
 
 # Clone and sync dependencies
 git clone https://github.com/meta-pytorch/monarch.git
@@ -252,6 +257,51 @@ Check out the `examples/` directory for demonstrations of how to use Monarch's
 APIs.
 
 We'll be adding more examples as we stabilize and polish functionality!
+
+## RDMA Backends
+
+Monarch supports multiple RDMA transport backends, selected automatically:
+
+| Backend | Hardware | Use Case |
+|---------|----------|----------|
+| **ibverbs** | InfiniBand, RoCE, EFA (cross-node) | Traditional RDMA via libibverbs |
+| **OFI/libfabric** | AWS EFA | Same-node transfers via shared memory, cross-node via SRD |
+| **TCP** | Any network | Fallback when no RDMA hardware is available |
+
+On AWS EFA instances, the backend preference order is: ibverbs → OFI → TCP.
+The OFI backend is automatically enabled when libfabric headers are detected at
+build time (`/opt/amazon/efa/include/rdma/fabric.h`).
+
+```python
+from monarch.rdma import is_ofi_available, get_rdma_backend
+
+print(is_ofi_available())   # True on EFA instances with libfabric
+print(get_rdma_backend())   # "ofi", "ibverbs", or "tcp"
+```
+
+To force a specific backend for testing or benchmarking:
+
+```python
+from monarch.config import configured
+
+with configured(rdma_disable_ibverbs=True, rdma_allow_tcp_fallback=False):
+    # Forces OFI-only path
+    ...
+```
+
+Or via environment variables:
+
+```bash
+export MONARCH_RDMA_DISABLE_IBVERBS=true   # skip ibverbs
+export MONARCH_RDMA_DISABLE_OFI=true       # skip OFI
+export MONARCH_RDMA_ALLOW_TCP_FALLBACK=false  # no TCP fallback
+```
+
+The `rdma_pingpong.py` example supports `--rdma_backend` to compare backends:
+
+```bash
+python examples/rdma_pingpong.py --rdma_backend ofi --data_size_mb 100
+```
 
 ## Running tests
 
