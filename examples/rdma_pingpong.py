@@ -9,12 +9,14 @@ import os
 import socket
 import sys
 import time
+from contextlib import nullcontext
 from typing import Optional
 
 import fire
 import torch
 import xxhash
 from monarch.actor import Actor, endpoint, shutdown_context
+from monarch.config import configured
 from monarch.rdma import RDMABuffer
 
 
@@ -103,8 +105,14 @@ def main(
     hpc_cluster_uuid: str = "MastGenAICluster",
     rm_attribution: str = "msl_infra_pytorch_dev",
     buffer_type: str = "tensor",
+    rdma_backend: str = "auto",
 ):
-    """RDMA Pingpong: transfer data between two nodes via RDMABuffer."""
+    """RDMA Pingpong: transfer data between two nodes via RDMABuffer.
+
+    Args:
+        rdma_backend: Force a specific RDMA backend ("ibverbs", "ofi", "tcp",
+            or "auto" for default selection).
+    """
     sys.stdout.reconfigure(line_buffering=True)
     size = data_size_mb * 1024 * 1024
 
@@ -112,6 +120,21 @@ def main(
         raise ValueError(
             f"Unknown buffer_type: {buffer_type!r}; "
             "choose from 'tensor', 'bytearray', 'memoryview'"
+        )
+
+    # Set up RDMA backend configuration
+    if rdma_backend == "ibverbs":
+        rdma_cm = configured(rdma_allow_tcp_fallback=False, rdma_disable_ofi=True)
+    elif rdma_backend == "ofi":
+        rdma_cm = configured(rdma_disable_ibverbs=True, rdma_allow_tcp_fallback=False)
+    elif rdma_backend == "tcp":
+        rdma_cm = configured(rdma_disable_ibverbs=True, rdma_disable_ofi=True)
+    elif rdma_backend == "auto":
+        rdma_cm = nullcontext()
+    else:
+        raise ValueError(
+            f"Unknown rdma_backend: {rdma_backend!r}; "
+            "choose from 'auto', 'ibverbs', 'ofi', 'tcp'"
         )
 
     if backend == "mast":
@@ -139,41 +162,43 @@ def main(
             log_dir=os.path.expanduser("~/monarch_slurm_logs"),
         )
 
-    workers = job.state().workers
-    procs = workers.spawn_procs()
-    a0 = procs.spawn("a0", PingPongActor, size, buffer_type).slice(hosts=0)
-    a1 = procs.spawn("a1", PingPongActor, size, buffer_type).slice(hosts=1)
+    with rdma_cm:
+        workers = job.state().workers
+        procs = workers.spawn_procs()
+        a0 = procs.spawn("a0", PingPongActor, size, buffer_type).slice(hosts=0)
+        a1 = procs.spawn("a1", PingPongActor, size, buffer_type).slice(hosts=1)
 
-    a0.init_rdma.call_one().get()
-    a1.init_rdma.call_one().get()
-    buf0 = a0.get_buffer.call_one().get()
-    buf1 = a1.get_buffer.call_one().get()
-    cksum0 = a0.checksum.call_one("data").get()
-    cksum1 = a1.checksum.call_one("data").get()
+        a0.init_rdma.call_one().get()
+        a1.init_rdma.call_one().get()
+        buf0 = a0.get_buffer.call_one().get()
+        buf1 = a1.get_buffer.call_one().get()
+        cksum0 = a0.checksum.call_one("data").get()
+        cksum1 = a1.checksum.call_one("data").get()
 
-    print(
-        f"RDMA Pingpong: {data_size_mb} MB x {num_iterations} iters (buffer_type={buffer_type})"
-    )
-    for i in range(num_iterations):
-        # Ping: a0 reads from a1
-        dt = a0.read_from.call_one(buf1).get()
-        got = a0.checksum.call_one("recv").get()
-        ok = got == cksum1
         print(
-            f"  [{i + 1}] ping {dt:.3f}s {size / dt / 1e9:.2f} GB/s {'PASS' if ok else 'FAIL'}"
+            f"RDMA Pingpong: {data_size_mb} MB x {num_iterations} iters "
+            f"(buffer_type={buffer_type}, rdma_backend={rdma_backend})"
         )
+        for i in range(num_iterations):
+            # Ping: a0 reads from a1
+            dt = a0.read_from.call_one(buf1).get()
+            got = a0.checksum.call_one("recv").get()
+            ok = got == cksum1
+            print(
+                f"  [{i + 1}] ping {dt:.3f}s {size / dt / 1e9:.2f} GB/s {'PASS' if ok else 'FAIL'}"
+            )
 
-        # Pong: a1 reads from a0
-        dt = a1.read_from.call_one(buf0).get()
-        got = a1.checksum.call_one("recv").get()
-        ok = got == cksum0
-        print(
-            f"  [{i + 1}] pong {dt:.3f}s {size / dt / 1e9:.2f} GB/s {'PASS' if ok else 'FAIL'}"
-        )
+            # Pong: a1 reads from a0
+            dt = a1.read_from.call_one(buf0).get()
+            got = a1.checksum.call_one("recv").get()
+            ok = got == cksum0
+            print(
+                f"  [{i + 1}] pong {dt:.3f}s {size / dt / 1e9:.2f} GB/s {'PASS' if ok else 'FAIL'}"
+            )
 
-    workers.shutdown().get()
-    shutdown_context().get()
-    print("Done!")
+        workers.shutdown().get()
+        shutdown_context().get()
+        print("Done!")
 
 
 if __name__ == "__main__":

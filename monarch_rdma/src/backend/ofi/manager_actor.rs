@@ -44,6 +44,7 @@ use crate::RdmaOpType;
 use crate::RdmaTransportLevel;
 use crate::backend::RdmaBackend;
 use crate::local_memory::RdmaLocalMemory;
+use crate::rdma_manager_actor::GetOfiActorRefClient;
 use crate::rdma_manager_actor::RdmaManagerActor;
 use crate::rdma_manager_actor::RdmaManagerMessageClient;
 
@@ -163,9 +164,11 @@ impl OfiManagerActor {
     ) -> Result<libfabric_sys::fi_addr_t> {
         let peer_id = remote.actor_id().clone();
         if let Some(&addr) = self.peer_addrs.get(&peer_id) {
+            tracing::debug!(%peer_id, fi_addr = addr, "peer address cache hit");
             return Ok(addr);
         }
 
+        tracing::debug!(%peer_id, "peer address cache miss, exchanging addresses");
         let remote_info = remote.get_endpoint_addr(cx).await?;
         let fi_addr = self.endpoint.av_insert(&self.domain, &remote_info)?;
         self.peer_addrs.insert(peer_id, fi_addr);
@@ -173,10 +176,67 @@ impl OfiManagerActor {
     }
 
     /// Register a local memory region and return the MR + key.
+    ///
+    /// When the domain was negotiated with HMEM, all registrations must go
+    /// through `fi_mr_regattr` — even for CPU memory (`FI_HMEM_SYSTEM`).
+    /// GPU memory uses `FI_HMEM_CUDA` with the device ordinal.
     fn register_local_mr(&mut self, addr: usize, size: usize) -> Result<OfiMr> {
         let key = self.next_mr_key;
         self.next_mr_key += 1;
-        self.endpoint.register_mr(&self.domain, addr, size, key)
+
+        if self.domain.hmem_supported {
+            if crate::local_memory::is_device_ptr(addr) {
+                let ordinal = Self::cuda_device_ordinal(addr)?;
+                tracing::debug!(
+                    addr,
+                    size,
+                    key,
+                    ordinal,
+                    "registering GPU MR via fi_mr_regattr (FI_HMEM_CUDA)",
+                );
+                self.endpoint.register_mr_hmem(
+                    &self.domain,
+                    addr,
+                    size,
+                    key,
+                    libfabric_sys::fi_hmem_iface_FI_HMEM_CUDA,
+                    ordinal,
+                )
+            } else {
+                tracing::debug!(addr, size, key, "registering CPU MR via fi_mr_regattr (FI_HMEM_SYSTEM)");
+                self.endpoint.register_mr_hmem(
+                    &self.domain,
+                    addr,
+                    size,
+                    key,
+                    libfabric_sys::fi_hmem_iface_FI_HMEM_SYSTEM,
+                    0,
+                )
+            }
+        } else {
+            tracing::debug!(addr, size, key, "registering CPU MR via fi_mr_reg");
+            self.endpoint.register_mr(&self.domain, addr, size, key)
+        }
+    }
+
+    /// Extract the CUDA device ordinal for a GPU pointer.
+    fn cuda_device_ordinal(addr: usize) -> Result<i32> {
+        let mut ordinal: i32 = -1;
+        let err = unsafe {
+            rdmaxcel_sys::rdmaxcel_cuPointerGetAttribute(
+                &mut ordinal as *mut _ as *mut std::ffi::c_void,
+                rdmaxcel_sys::CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL,
+                addr as rdmaxcel_sys::CUdeviceptr,
+            )
+        };
+        if err != rdmaxcel_sys::CUDA_SUCCESS || ordinal < 0 {
+            anyhow::bail!(
+                "failed to get CUDA device ordinal for addr {:#x}: err={}",
+                addr,
+                err,
+            );
+        }
+        Ok(ordinal)
     }
 
     /// Execute an RDMA op: register local MR, resolve peer, fi_write/fi_read, poll CQ.
@@ -190,6 +250,16 @@ impl OfiManagerActor {
         remote_buf: &OfiBuffer,
         timeout: Duration,
     ) -> Result<()> {
+        let op_start = std::time::Instant::now();
+        tracing::debug!(
+            ?op_type,
+            local_addr,
+            local_size,
+            remote_addr = remote_buf.addr,
+            remote_rkey = remote_buf.rkey,
+            "OFI op starting",
+        );
+
         // 1. Register local memory
         let local_mr = self.register_local_mr(local_addr, local_size)?;
 
@@ -225,6 +295,14 @@ impl OfiManagerActor {
 
         // 4. Poll CQ for completion
         self.endpoint.poll_cq(&self.domain, timeout)?;
+
+        let elapsed = op_start.elapsed();
+        tracing::debug!(
+            ?op_type,
+            local_size,
+            elapsed_us = elapsed.as_micros() as u64,
+            "OFI op completed",
+        );
 
         // local_mr dropped here, deregisters MR
         Ok(())
