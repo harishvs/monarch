@@ -282,31 +282,50 @@ impl OfiManagerActor {
         // 2. Resolve peer address
         let fi_addr = self.resolve_peer(cx, remote_mgr).await?;
 
-        // 3. Perform RDMA operation
-        let result = match op_type {
-            RdmaOpType::WriteFromLocal => self.endpoint.write(
-                local_addr as u64,
-                local_size,
-                local_mr.desc(),
-                remote_buf.addr,
-                remote_buf.rkey,
-                fi_addr,
-                ptr::null_mut(),
-            ),
-            RdmaOpType::ReadIntoLocal => self.endpoint.read(
-                local_addr as u64,
-                local_size,
-                local_mr.desc(),
-                remote_buf.addr,
-                remote_buf.rkey,
-                fi_addr,
-                ptr::null_mut(),
-            ),
-        };
+        // 3. Perform RDMA operation with retry — EFA's RDM layer may
+        //    return EAGAIN while the internal peer handshake completes.
+        //    Drive CQ progress between retries so the provider can process
+        //    control messages.
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let result = match op_type {
+                RdmaOpType::WriteFromLocal => self.endpoint.write(
+                    local_addr as u64,
+                    local_size,
+                    local_mr.desc(),
+                    remote_buf.addr,
+                    remote_buf.rkey,
+                    fi_addr,
+                    ptr::null_mut(),
+                ),
+                RdmaOpType::ReadIntoLocal => self.endpoint.read(
+                    local_addr as u64,
+                    local_size,
+                    local_mr.desc(),
+                    remote_buf.addr,
+                    remote_buf.rkey,
+                    fi_addr,
+                    ptr::null_mut(),
+                ),
+            };
 
-        if let Err(e) = result {
-            // local_mr dropped here, deregisters MR
-            return Err(e);
+            match result {
+                Ok(()) => break,
+                Err(e) if format!("{}", e).contains("-11") && std::time::Instant::now() < deadline => {
+                    // EAGAIN — drive CQ progress and retry
+                    let mut dummy: libfabric_sys::fi_cq_data_entry = unsafe { std::mem::zeroed() };
+                    unsafe {
+                        libfabric_sys::libfabric_sys_fi_cq_read(
+                            self.domain.cq,
+                            &mut dummy as *mut _ as *mut _,
+                            1,
+                        );
+                    }
+                    std::thread::yield_now();
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
         }
 
         // 4. Poll CQ for completion
