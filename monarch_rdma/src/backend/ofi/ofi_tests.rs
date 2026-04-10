@@ -197,62 +197,43 @@ mod tests {
             return;
         }
 
-        // Use non-HMEM domain for CPU tests — avoids FI_MSG_PREFIX mode
-        // and CUDA P2P issues that don't apply to CPU-only transfers.
         let config = OfiConfig { request_hmem: false, ..OfiConfig::default() };
         let buf_size = 4096;
 
-        // Allocate two CPU buffers
         let mut src_buf = vec![42u8; buf_size];
         let mut dst_buf = vec![0u8; buf_size];
 
-        // Create two domain+endpoint pairs
-        let domain1 = OfiDomain::new(&config).expect("domain1 failed");
-        let ep1 = OfiEndpoint::new(&domain1).expect("ep1 failed");
+        // Shared domain with two endpoints — same-process peers share a
+        // domain so the EFA RDM layer can route internally without a
+        // cross-domain handshake.
+        let domain = OfiDomain::new(&config).expect("domain creation failed");
+        let ep1 = OfiEndpoint::new(&domain).expect("ep1 failed");
+        let ep2 = OfiEndpoint::new(&domain).expect("ep2 failed");
 
-        let domain2 = OfiDomain::new(&config).expect("domain2 failed");
-        let ep2 = OfiEndpoint::new(&domain2).expect("ep2 failed");
-
-        // Exchange addresses
         let info1 = ep1.get_name().expect("get_name ep1 failed");
         let info2 = ep2.get_name().expect("get_name ep2 failed");
 
-        let fi_addr2_on_ep1 = ep1
-            .av_insert(&domain1, &info2)
-            .expect("av_insert failed");
+        let fi_addr2_on_ep1 = ep1.av_insert(&domain, &info2).expect("av_insert failed");
+        let _fi_addr1_on_ep2 = ep2.av_insert(&domain, &info1).expect("av_insert failed");
 
-        // ep2 also needs to know ep1 for the completion to work
-        let _fi_addr1_on_ep2 = ep2
-            .av_insert(&domain2, &info1)
-            .expect("av_insert failed");
+        let src_mr = register_cpu_mr(&ep1, &domain, src_buf.as_mut_ptr() as usize, buf_size, 1);
+        let dst_mr = register_cpu_mr(&ep2, &domain, dst_buf.as_mut_ptr() as usize, buf_size, 2);
 
-        // Register MRs (HMEM-aware: uses fi_mr_regattr even for CPU when needed)
-        let src_mr = register_cpu_mr(&ep1, &domain1, src_buf.as_mut_ptr() as usize, buf_size, 1);
-        let dst_mr = register_cpu_mr(&ep2, &domain2, dst_buf.as_mut_ptr() as usize, buf_size, 2);
-
-        let remote_key = dst_mr.rkey;
-        let remote_addr = dst_buf.as_ptr() as u64;
-
-        // FI_CONTEXT2 mode requires a valid fi_context2 per operation
         let mut ctx: libfabric_sys::fi_context2 = unsafe { std::mem::zeroed() };
-
-        // Perform RDMA write: ep1 writes src_buf into dst_buf (on ep2)
         ep1.write(
             src_buf.as_ptr() as u64,
             buf_size,
             src_mr.desc(),
-            remote_addr,
-            remote_key,
+            dst_buf.as_ptr() as u64,
+            dst_mr.rkey,
             fi_addr2_on_ep1,
             &mut ctx as *mut _ as *mut std::ffi::c_void,
         )
         .expect("fi_write failed");
 
-        // Poll CQ on ep1 for write completion
-        ep1.poll_cq(&domain1, Duration::from_secs(10))
+        ep1.poll_cq(&domain, Duration::from_secs(10))
             .expect("CQ poll timed out or errored");
 
-        // Verify data was written
         assert_eq!(
             dst_buf, src_buf,
             "destination buffer should match source after RDMA write"
@@ -268,57 +249,37 @@ mod tests {
         let config = OfiConfig { request_hmem: false, ..OfiConfig::default() };
         let buf_size = 4096;
 
-        // Allocate two CPU buffers: remote has the data, local receives it
         let mut remote_buf = vec![99u8; buf_size];
         let mut local_buf = vec![0u8; buf_size];
 
-        // Create two domain+endpoint pairs
-        let domain1 = OfiDomain::new(&config).expect("domain1 failed");
-        let ep1 = OfiEndpoint::new(&domain1).expect("ep1 failed");
+        let domain = OfiDomain::new(&config).expect("domain creation failed");
+        let ep1 = OfiEndpoint::new(&domain).expect("ep1 failed");
+        let ep2 = OfiEndpoint::new(&domain).expect("ep2 failed");
 
-        let domain2 = OfiDomain::new(&config).expect("domain2 failed");
-        let ep2 = OfiEndpoint::new(&domain2).expect("ep2 failed");
-
-        // Exchange addresses
         let info1 = ep1.get_name().expect("get_name ep1 failed");
         let info2 = ep2.get_name().expect("get_name ep2 failed");
 
-        let fi_addr2_on_ep1 = ep1
-            .av_insert(&domain1, &info2)
-            .expect("av_insert failed");
+        let fi_addr2_on_ep1 = ep1.av_insert(&domain, &info2).expect("av_insert failed");
+        let _fi_addr1_on_ep2 = ep2.av_insert(&domain, &info1).expect("av_insert failed");
 
-        let _fi_addr1_on_ep2 = ep2
-            .av_insert(&domain2, &info1)
-            .expect("av_insert failed");
+        let local_mr = register_cpu_mr(&ep1, &domain, local_buf.as_mut_ptr() as usize, buf_size, 1);
+        let remote_mr = register_cpu_mr(&ep2, &domain, remote_buf.as_mut_ptr() as usize, buf_size, 2);
 
-        // Register MRs (HMEM-aware)
-        let local_mr = register_cpu_mr(&ep1, &domain1, local_buf.as_mut_ptr() as usize, buf_size, 1);
-
-        let remote_mr = register_cpu_mr(&ep2, &domain2, remote_buf.as_mut_ptr() as usize, buf_size, 2);
-
-        let remote_key = remote_mr.rkey;
-        let remote_addr = remote_buf.as_ptr() as u64;
-
-        // FI_CONTEXT2 mode requires a valid fi_context2 per operation
         let mut ctx: libfabric_sys::fi_context2 = unsafe { std::mem::zeroed() };
-
-        // Perform RDMA read: ep1 reads remote_buf (on ep2) into local_buf
         ep1.read(
             local_buf.as_mut_ptr() as u64,
             buf_size,
             local_mr.desc(),
-            remote_addr,
-            remote_key,
+            remote_buf.as_ptr() as u64,
+            remote_mr.rkey,
             fi_addr2_on_ep1,
             &mut ctx as *mut _ as *mut std::ffi::c_void,
         )
         .expect("fi_read failed");
 
-        // Poll CQ on ep1 for read completion
-        ep1.poll_cq(&domain1, Duration::from_secs(10))
+        ep1.poll_cq(&domain, Duration::from_secs(10))
             .expect("CQ poll timed out or errored");
 
-        // Verify data was read
         assert_eq!(
             local_buf, remote_buf,
             "local buffer should match remote after RDMA read"

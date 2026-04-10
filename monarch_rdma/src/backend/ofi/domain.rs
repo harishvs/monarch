@@ -173,7 +173,9 @@ impl OfiDomain {
             caps |= libfabric_sys::FI_HMEM as u64;
         }
         (*hints).caps = caps;
-        (*hints).mode = libfabric_sys::LIBFABRIC_SYS_FI_LOCAL_MR;
+        // Do not set FI_LOCAL_MR in mode — it's deprecated and forces
+        // the efa-direct provider which requires manual receive buffer
+        // management. Let the provider set mr_mode in the returned info.
 
         if !config.provider.is_empty() {
             let prov = CString::new(config.provider.as_str())
