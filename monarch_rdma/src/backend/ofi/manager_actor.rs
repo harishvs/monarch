@@ -157,6 +157,11 @@ impl OfiManagerActor {
     }
 
     /// Get or insert a peer's fi_addr_t by exchanging endpoint addresses.
+    ///
+    /// When the remote peer is the same actor (same-process loopback),
+    /// resolves the local address directly to avoid a deadlock — hyperactor
+    /// processes messages one at a time per actor, so sending a message
+    /// from an actor to itself during handler execution would block forever.
     async fn resolve_peer(
         &mut self,
         cx: &Context<'_, Self>,
@@ -168,8 +173,19 @@ impl OfiManagerActor {
             return Ok(addr);
         }
 
-        tracing::debug!(%peer_id, "peer address cache miss, exchanging addresses");
-        let remote_info = remote.get_endpoint_addr(cx).await?;
+        // Detect same-actor loopback: if the remote is us, use local
+        // endpoint address directly instead of sending a message (which
+        // would deadlock since we're already processing ExecuteOp).
+        // Same pattern as ibverbs manager_actor.rs line 666.
+        let self_ref: reference::ActorRef<OfiManagerActor> = cx.bind();
+        let remote_info = if remote.actor_id() == self_ref.actor_id() {
+            tracing::debug!(%peer_id, "same-actor loopback, using local endpoint address");
+            self.endpoint.get_name()?
+        } else {
+            tracing::debug!(%peer_id, "peer address cache miss, exchanging addresses");
+            remote.get_endpoint_addr(cx).await?
+        };
+
         let fi_addr = self.endpoint.av_insert(&self.domain, &remote_info)?;
         self.peer_addrs.insert(peer_id, fi_addr);
         Ok(fi_addr)
