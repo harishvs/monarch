@@ -338,6 +338,15 @@ rust_features = ["extension-module", "distributed_sql_telemetry"]
 if build_tensor_engine:
     rust_features.append("tensor_engine")
 
+# Enable OFI (libfabric) backend when libfabric headers are available
+_ofi_header_paths = [
+    "/opt/amazon/efa/include/rdma/fabric.h",  # AWS EFA
+    "/usr/local/include/rdma/fabric.h",        # manual install
+    "/usr/include/rdma/fabric.h",              # system package
+]
+if any(os.path.exists(p) for p in _ofi_header_paths):
+    rust_features.append("ofi")
+
 rust_extensions.append(
     RustExtension(
         "monarch._rust_bindings",

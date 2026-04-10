@@ -22,5 +22,8 @@ serde_json = { version = "1.0.140", features = ["alloc", "float_roundtrip", "raw
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 typeuri = { version = "0.0.0", path = "../../typeuri" }
 
+[features]
+ofi = ["monarch_rdma/ofi"]
+
 [build-dependencies]
 build_utils = { path = "../../build_utils" }
