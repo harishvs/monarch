@@ -286,6 +286,11 @@ impl OfiManagerActor {
         //    return EAGAIN while the internal peer handshake completes.
         //    Drive CQ progress between retries so the provider can process
         //    control messages.
+        //
+        //    Uses tokio::task::yield_now() instead of thread::yield_now()
+        //    so the async runtime can schedule other tasks (including actor
+        //    message handlers on the remote side that need to drive their
+        //    own CQ progress for the cross-node handshake to complete).
         let deadline = std::time::Instant::now() + timeout;
         loop {
             let result = match op_type {
@@ -312,24 +317,82 @@ impl OfiManagerActor {
             match result {
                 Ok(()) => break,
                 Err(e) if format!("{}", e).contains("-11") && std::time::Instant::now() < deadline => {
-                    // EAGAIN — drive CQ progress and retry
-                    let mut dummy: libfabric_sys::fi_cq_data_entry = unsafe { std::mem::zeroed() };
-                    unsafe {
-                        libfabric_sys::libfabric_sys_fi_cq_read(
-                            self.domain.cq,
-                            &mut dummy as *mut _ as *mut _,
-                            1,
-                        );
+                    // EAGAIN — drive CQ progress and yield to tokio.
+                    // Scope the non-Send fi_cq_data_entry so it's dropped before await.
+                    {
+                        let mut dummy: libfabric_sys::fi_cq_data_entry = unsafe { std::mem::zeroed() };
+                        unsafe {
+                            libfabric_sys::libfabric_sys_fi_cq_read(
+                                self.domain.cq,
+                                &mut dummy as *mut _ as *mut _,
+                                1,
+                            );
+                        }
                     }
-                    std::thread::yield_now();
+                    tokio::task::yield_now().await;
                     continue;
                 }
                 Err(e) => return Err(e),
             }
         }
 
-        // 4. Poll CQ for completion
-        self.endpoint.poll_cq(&self.domain, timeout)?;
+        // 4. Poll CQ for completion — use async yield between polls
+        //    so the tokio runtime stays responsive for other tasks.
+        let cq_deadline = std::time::Instant::now() + timeout;
+        loop {
+            // Scope non-Send types so they're dropped before await
+            let poll_result = {
+                let mut entry: libfabric_sys::fi_cq_data_entry = unsafe { std::mem::zeroed() };
+                let ret = unsafe {
+                    libfabric_sys::libfabric_sys_fi_cq_read(
+                        self.domain.cq,
+                        &mut entry as *mut _ as *mut _,
+                        1,
+                    )
+                };
+
+                if ret > 0 {
+                    Ok(true) // completion received
+                } else if ret == -(libfabric_sys::FI_EAGAIN as isize) {
+                    Ok(false) // no completion yet
+                } else {
+                    // Error — read error entry for details
+                    let mut err_entry: libfabric_sys::fi_cq_err_entry =
+                        unsafe { std::mem::zeroed() };
+                    unsafe {
+                        libfabric_sys::libfabric_sys_fi_cq_readerr(
+                            self.domain.cq,
+                            &mut err_entry,
+                            0,
+                        );
+                    }
+                    tracing::error!(
+                        cq_ret = ret,
+                        err = err_entry.err,
+                        prov_errno = err_entry.prov_errno,
+                        "CQ error in execute_op_impl",
+                    );
+                    Err(anyhow::anyhow!(
+                        "fi_cq_read error: ret={}, err={}, prov_errno={}",
+                        ret,
+                        err_entry.err,
+                        err_entry.prov_errno,
+                    ))
+                }
+            };
+
+            match poll_result {
+                Ok(true) => break,
+                Ok(false) => {
+                    if std::time::Instant::now() >= cq_deadline {
+                        anyhow::bail!("CQ poll timed out");
+                    }
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
 
         let elapsed = op_start.elapsed();
         tracing::debug!(
