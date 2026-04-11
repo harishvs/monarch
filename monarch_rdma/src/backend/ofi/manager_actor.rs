@@ -62,13 +62,35 @@ pub enum OfiManagerMessage {
         reply: reference::OncePortRef<Option<OfiBuffer>>,
     },
     /// Release a buffer registration (fire-and-forget).
-    ReleaseBuffer {
-        remote_buf_id: usize,
-    },
+    ReleaseBuffer { remote_buf_id: usize },
     /// Get this endpoint's address for peer exchange.
     GetEndpointAddr {
         #[reply]
         reply: reference::OncePortRef<OfiEndpointInfo>,
+    },
+    /// (Messaging path) Post fi_recv into a registered buffer.
+    ///
+    /// The remote side posts a receive buffer so the caller can fi_send
+    /// data into it. Used on providers without RMA (e.g., P4d / Nitro v3).
+    PostRecv {
+        buf_id: usize,
+        size: usize,
+        sender: reference::ActorRef<OfiManagerActor>,
+        timeout_ms: u64,
+        #[reply]
+        reply: reference::OncePortRef<Result<(), String>>,
+    },
+    /// (Messaging path) fi_send data from a registered buffer to the caller.
+    ///
+    /// The remote side reads from its own buffer and sends it via fi_send
+    /// to the caller. Used for ReadIntoLocal on non-RMA providers.
+    SendFromBuffer {
+        buf_id: usize,
+        size: usize,
+        dest: reference::ActorRef<OfiManagerActor>,
+        timeout_ms: u64,
+        #[reply]
+        reply: reference::OncePortRef<Result<(), String>>,
     },
 }
 wirevalue::register_type!(OfiManagerMessage);
@@ -78,7 +100,7 @@ wirevalue::register_type!(OfiManagerMessage);
 // ---------------------------------------------------------------------------
 
 /// Local-only messages for operations that must run on the actor owning
-/// the OFI endpoint (fi_write/fi_read/CQ poll are not thread-safe).
+/// the OFI endpoint (fi_write/fi_read/fi_send/CQ poll are not thread-safe).
 #[derive(Handler, HandleClient, Debug)]
 pub enum OfiManagerLocalMessage {
     /// Execute an RDMA operation (read or write) through the OFI endpoint.
@@ -88,6 +110,7 @@ pub enum OfiManagerLocalMessage {
         local_size: usize,
         remote_ofi_mgr: reference::ActorRef<OfiManagerActor>,
         remote_buffer: OfiBuffer,
+        remote_buf_id: usize,
         timeout_ms: u64,
         #[reply]
         reply: OncePortHandle<Result<(), String>>,
@@ -98,6 +121,33 @@ pub enum OfiManagerLocalMessage {
 // Actor definition
 // ---------------------------------------------------------------------------
 
+/// Guard that stops the background CQ progress thread on drop.
+/// Signals the cancel flag and joins the thread to ensure it's
+/// fully stopped before the CQ/domain resources are freed.
+struct CqProgressGuard {
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// When > 0, the background thread skips fi_cq_read so the main
+    /// operation thread can read completions without them being stolen.
+    active_ops: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl std::fmt::Debug for CqProgressGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CqProgressGuard").finish()
+    }
+}
+
+impl Drop for CqProgressGuard {
+    fn drop(&mut self) {
+        self.cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(handle) = self.thread.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 /// Manages all libfabric resources for a single process.
 #[derive(Debug)]
 #[hyperactor::export(
@@ -105,6 +155,11 @@ pub enum OfiManagerLocalMessage {
 )]
 pub struct OfiManagerActor {
     owner: std::sync::OnceLock<ActorHandle<RdmaManagerActor>>,
+
+    /// Background CQ progress thread. Declared BEFORE domain/endpoint
+    /// so it's dropped first (Rust drops fields in declaration order),
+    /// ensuring the thread stops before the CQ is closed.
+    _progress_guard: CqProgressGuard,
 
     domain: OfiDomain,
     endpoint: OfiEndpoint,
@@ -125,10 +180,19 @@ pub struct OfiManagerActor {
 impl Actor for OfiManagerActor {
     async fn init(&mut self, this: &Instance<Self>) -> Result<(), anyhow::Error> {
         let rdma_handle = RdmaManagerActor::local_handle(this);
-        self.owner.set(rdma_handle).map_err(|_| {
-            anyhow::anyhow!("OfiManagerActor owner already set")
-        })?;
+        self.owner
+            .set(rdma_handle)
+            .map_err(|_| anyhow::anyhow!("OfiManagerActor owner already set"))?;
         Ok(())
+    }
+}
+
+/// RAII guard that pauses the background CQ progress thread while
+/// the main thread is posting operations and polling completions.
+struct ActiveOpsGuard(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+impl Drop for ActiveOpsGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -143,10 +207,58 @@ impl OfiManagerActor {
         let domain = OfiDomain::new(&config)?;
         let endpoint = OfiEndpoint::new(&domain)?;
 
+        // Spawn a background thread that continuously drives CQ progress.
+        // This is needed for cross-node transfers: the remote peer's
+        // libfabric layer sends control messages (handshake, read requests)
+        // that must be processed by polling fi_cq_read. Without this thread,
+        // cross-node operations time out because nobody processes incoming
+        // messages on the server side.
+        //
+        // This is the same approach NCCL's aws-ofi-nccl plugin uses.
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let active_ops = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cancel_clone = cancel.clone();
+        let active_ops_clone = active_ops.clone();
+        let cq_ptr = domain.cq as usize; // pass as usize to avoid Send issues with raw ptr
+        let progress_thread = std::thread::Builder::new()
+            .name("ofi-cq-progress".to_string())
+            .spawn(move || {
+                let cq = cq_ptr as *mut libfabric_sys::fid_cq;
+                while !cancel_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                    // Only poll CQ when no active operations are running.
+                    // When an operation IS active, the main thread in execute_op_impl
+                    // handles all CQ reads. If we also polled here, we'd steal the
+                    // completion entry (CQ entries can only be read once) and the
+                    // main thread would time out waiting for a completion that was
+                    // already consumed.
+                    if active_ops_clone.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+                        let mut entry: libfabric_sys::fi_cq_data_entry =
+                            unsafe { std::mem::zeroed() };
+                        unsafe {
+                            libfabric_sys::libfabric_sys_fi_cq_read(
+                                cq,
+                                &mut entry as *mut _ as *mut _,
+                                1,
+                            );
+                        }
+                    }
+                    // Sleep briefly to avoid spinning at 100% CPU.
+                    // 100μs gives ~10,000 polls/sec which is responsive
+                    // enough for network handshakes while being gentle on CPU.
+                    std::thread::sleep(std::time::Duration::from_micros(100));
+                }
+            })
+            .ok();
+
         tracing::info!("OFI backend initialized (provider: {:?})", config.provider);
 
         Ok(Self {
             owner: std::sync::OnceLock::new(),
+            _progress_guard: CqProgressGuard {
+                cancel,
+                active_ops,
+                thread: progress_thread,
+            },
             domain,
             endpoint,
             buffer_registrations: HashMap::new(),
@@ -169,7 +281,7 @@ impl OfiManagerActor {
     ) -> Result<libfabric_sys::fi_addr_t> {
         let peer_id = remote.actor_id().clone();
         if let Some(&addr) = self.peer_addrs.get(&peer_id) {
-            tracing::debug!(%peer_id, fi_addr = addr, "peer address cache hit");
+            tracing::info!(%peer_id, fi_addr = addr, "peer address cache hit");
             return Ok(addr);
         }
 
@@ -179,10 +291,10 @@ impl OfiManagerActor {
         // Same pattern as ibverbs manager_actor.rs line 666.
         let self_ref: reference::ActorRef<OfiManagerActor> = cx.bind();
         let remote_info = if remote.actor_id() == self_ref.actor_id() {
-            tracing::debug!(%peer_id, "same-actor loopback, using local endpoint address");
+            tracing::info!(%peer_id, "same-actor loopback, using local endpoint address");
             self.endpoint.get_name()?
         } else {
-            tracing::debug!(%peer_id, "peer address cache miss, exchanging addresses");
+            tracing::info!(%peer_id, "peer address cache miss, exchanging addresses");
             remote.get_endpoint_addr(cx).await?
         };
 
@@ -219,7 +331,12 @@ impl OfiManagerActor {
                     ordinal,
                 )
             } else {
-                tracing::debug!(addr, size, key, "registering CPU MR via fi_mr_regattr (FI_HMEM_SYSTEM)");
+                tracing::debug!(
+                    addr,
+                    size,
+                    key,
+                    "registering CPU MR via fi_mr_regattr (FI_HMEM_SYSTEM)"
+                );
                 self.endpoint.register_mr_hmem(
                     &self.domain,
                     addr,
@@ -255,72 +372,54 @@ impl OfiManagerActor {
         Ok(ordinal)
     }
 
-    /// Execute an RDMA op: register local MR, resolve peer, fi_write/fi_read, poll CQ.
-    async fn execute_op_impl(
-        &mut self,
-        cx: &Context<'_, Self>,
-        op_type: RdmaOpType,
-        local_addr: usize,
-        local_size: usize,
-        remote_mgr: &reference::ActorRef<OfiManagerActor>,
-        remote_buf: &OfiBuffer,
+    // -------------------------------------------------------------------
+    // Shared helper: post operation + EAGAIN retry + CQ poll
+    // -------------------------------------------------------------------
+
+    /// Pause the CQ progress thread and return an RAII guard.
+    fn pause_cq_progress(&self) -> ActiveOpsGuard {
+        self._progress_guard
+            .active_ops
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        ActiveOpsGuard(self._progress_guard.active_ops.clone())
+    }
+
+    /// Post an operation with EAGAIN retry, then poll CQ for one completion.
+    ///
+    /// This is the shared core for fi_write, fi_send, etc. The `post_fn`
+    /// closure is called to post the operation. On EAGAIN, CQ progress is
+    /// driven and tokio yields before retrying. After a successful post,
+    /// the CQ is polled until one completion arrives or timeout.
+    async fn post_and_poll_cq(
+        &self,
+        post_fn: impl Fn() -> Result<()>,
         timeout: Duration,
+        label: &str,
     ) -> Result<()> {
         let op_start = std::time::Instant::now();
-        tracing::debug!(
-            ?op_type,
-            local_addr,
-            local_size,
-            remote_addr = remote_buf.addr,
-            remote_rkey = remote_buf.rkey,
-            "OFI op starting",
-        );
+        let _ops_guard = self.pause_cq_progress();
 
-        // 1. Register local memory
-        let local_mr = self.register_local_mr(local_addr, local_size)?;
-
-        // 2. Resolve peer address
-        let fi_addr = self.resolve_peer(cx, remote_mgr).await?;
-
-        // 3. Perform RDMA operation with retry — EFA's RDM layer may
-        //    return EAGAIN while the internal peer handshake completes.
-        //    Drive CQ progress between retries so the provider can process
-        //    control messages.
-        //
-        //    Uses tokio::task::yield_now() instead of thread::yield_now()
-        //    so the async runtime can schedule other tasks (including actor
-        //    message handlers on the remote side that need to drive their
-        //    own CQ progress for the cross-node handshake to complete).
+        // Post with EAGAIN retry
+        let mut eagain_retries: u64 = 0;
         let deadline = std::time::Instant::now() + timeout;
         loop {
-            let result = match op_type {
-                RdmaOpType::WriteFromLocal => self.endpoint.write(
-                    local_addr as u64,
-                    local_size,
-                    local_mr.desc(),
-                    remote_buf.addr,
-                    remote_buf.rkey,
-                    fi_addr,
-                    ptr::null_mut(),
-                ),
-                RdmaOpType::ReadIntoLocal => self.endpoint.read(
-                    local_addr as u64,
-                    local_size,
-                    local_mr.desc(),
-                    remote_buf.addr,
-                    remote_buf.rkey,
-                    fi_addr,
-                    ptr::null_mut(),
-                ),
-            };
-
-            match result {
-                Ok(()) => break,
-                Err(e) if format!("{}", e).contains("-11") && std::time::Instant::now() < deadline => {
-                    // EAGAIN — drive CQ progress and yield to tokio.
-                    // Scope the non-Send fi_cq_data_entry so it's dropped before await.
+            match post_fn() {
+                Ok(()) => {
+                    tracing::info!(
+                        elapsed_us = op_start.elapsed().as_micros() as u64,
+                        eagain_retries,
+                        label,
+                        "OFI op posted successfully",
+                    );
+                    break;
+                }
+                Err(e)
+                    if format!("{}", e).contains("-11") && std::time::Instant::now() < deadline =>
+                {
+                    eagain_retries += 1;
                     {
-                        let mut dummy: libfabric_sys::fi_cq_data_entry = unsafe { std::mem::zeroed() };
+                        let mut dummy: libfabric_sys::fi_cq_data_entry =
+                            unsafe { std::mem::zeroed() };
                         unsafe {
                             libfabric_sys::libfabric_sys_fi_cq_read(
                                 self.domain.cq,
@@ -336,11 +435,23 @@ impl OfiManagerActor {
             }
         }
 
-        // 4. Poll CQ for completion — use async yield between polls
-        //    so the tokio runtime stays responsive for other tasks.
-        let cq_deadline = std::time::Instant::now() + timeout;
+        // Poll CQ for one completion
+        self.poll_cq_async(timeout).await?;
+
+        tracing::info!(
+            elapsed_us = op_start.elapsed().as_micros() as u64,
+            label,
+            "OFI op completed",
+        );
+        Ok(())
+    }
+
+    /// Poll CQ for one completion asynchronously, yielding to tokio between polls.
+    ///
+    /// Caller must have paused the CQ progress thread (ActiveOpsGuard).
+    async fn poll_cq_async(&self, timeout: Duration) -> Result<()> {
+        let deadline = std::time::Instant::now() + timeout;
         loop {
-            // Scope non-Send types so they're dropped before await
             let poll_result = {
                 let mut entry: libfabric_sys::fi_cq_data_entry = unsafe { std::mem::zeroed() };
                 let ret = unsafe {
@@ -352,11 +463,10 @@ impl OfiManagerActor {
                 };
 
                 if ret > 0 {
-                    Ok(true) // completion received
+                    Ok(true)
                 } else if ret == -(libfabric_sys::FI_EAGAIN as isize) {
-                    Ok(false) // no completion yet
+                    Ok(false)
                 } else {
-                    // Error — read error entry for details
                     let mut err_entry: libfabric_sys::fi_cq_err_entry =
                         unsafe { std::mem::zeroed() };
                     unsafe {
@@ -370,7 +480,7 @@ impl OfiManagerActor {
                         cq_ret = ret,
                         err = err_entry.err,
                         prov_errno = err_entry.prov_errno,
-                        "CQ error in execute_op_impl",
+                        "CQ error",
                     );
                     Err(anyhow::anyhow!(
                         "fi_cq_read error: ret={}, err={}, prov_errno={}",
@@ -382,9 +492,13 @@ impl OfiManagerActor {
             };
 
             match poll_result {
-                Ok(true) => break,
+                Ok(true) => return Ok(()),
                 Ok(false) => {
-                    if std::time::Instant::now() >= cq_deadline {
+                    if std::time::Instant::now() >= deadline {
+                        tracing::error!(
+                            timeout_ms = timeout.as_millis() as u64,
+                            "CQ poll timed out — no completion received",
+                        );
                         anyhow::bail!("CQ poll timed out");
                     }
                     tokio::task::yield_now().await;
@@ -393,17 +507,211 @@ impl OfiManagerActor {
                 Err(e) => return Err(e),
             }
         }
+    }
 
-        let elapsed = op_start.elapsed();
-        tracing::debug!(
+    // -------------------------------------------------------------------
+    // Main operation dispatch
+    // -------------------------------------------------------------------
+
+    /// Execute an RDMA op: register local MR, resolve peer, transfer data, poll CQ.
+    ///
+    /// Dispatches to the RMA path (fi_write/fi_read) or messaging path
+    /// (fi_send/fi_recv) based on provider capabilities.
+    async fn execute_op_impl(
+        &mut self,
+        cx: &Context<'_, Self>,
+        op_type: RdmaOpType,
+        local_addr: usize,
+        local_size: usize,
+        remote_mgr: &reference::ActorRef<OfiManagerActor>,
+        remote_buf: &OfiBuffer,
+        remote_buf_id: usize,
+        timeout: Duration,
+    ) -> Result<()> {
+        let op_start = std::time::Instant::now();
+        tracing::info!(
             ?op_type,
+            local_addr,
             local_size,
-            elapsed_us = elapsed.as_micros() as u64,
-            "OFI op completed",
+            rma_supported = self.domain.rma_supported,
+            remote_buf_id,
+            timeout_ms = timeout.as_millis() as u64,
+            "OFI op starting",
         );
 
-        // local_mr dropped here, deregisters MR
+        if self.domain.rma_supported {
+            self.execute_op_rma(cx, op_type, local_addr, local_size, remote_mgr, remote_buf, timeout)
+                .await
+        } else {
+            self.execute_op_msg(cx, op_type, local_addr, local_size, remote_mgr, remote_buf_id, timeout)
+                .await
+        }?;
+
+        tracing::info!(
+            ?op_type,
+            local_size,
+            elapsed_us = op_start.elapsed().as_micros() as u64,
+            "OFI op completed",
+        );
         Ok(())
+    }
+
+    // -------------------------------------------------------------------
+    // RMA path (fi_write / fi_read) — Nitro v4+
+    // -------------------------------------------------------------------
+
+    async fn execute_op_rma(
+        &mut self,
+        cx: &Context<'_, Self>,
+        op_type: RdmaOpType,
+        local_addr: usize,
+        local_size: usize,
+        remote_mgr: &reference::ActorRef<OfiManagerActor>,
+        remote_buf: &OfiBuffer,
+        timeout: Duration,
+    ) -> Result<()> {
+        let local_mr = self.register_local_mr(local_addr, local_size)?;
+        let fi_addr = self.resolve_peer(cx, remote_mgr).await?;
+
+        match op_type {
+            RdmaOpType::WriteFromLocal => {
+                self.post_and_poll_cq(
+                    || {
+                        self.endpoint.write(
+                            local_addr as u64,
+                            local_size,
+                            local_mr.desc(),
+                            remote_buf.addr,
+                            remote_buf.rkey,
+                            fi_addr,
+                            ptr::null_mut(),
+                        )
+                    },
+                    timeout,
+                    "rma_write",
+                )
+                .await
+            }
+            RdmaOpType::ReadIntoLocal => {
+                self.post_and_poll_cq(
+                    || {
+                        self.endpoint.read(
+                            local_addr as u64,
+                            local_size,
+                            local_mr.desc(),
+                            remote_buf.addr,
+                            remote_buf.rkey,
+                            fi_addr,
+                            ptr::null_mut(),
+                        )
+                    },
+                    timeout,
+                    "rma_read",
+                )
+                .await
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Messaging path (fi_send / fi_recv) — P4d / Nitro v3
+    // -------------------------------------------------------------------
+
+    async fn execute_op_msg(
+        &mut self,
+        cx: &Context<'_, Self>,
+        op_type: RdmaOpType,
+        local_addr: usize,
+        local_size: usize,
+        remote_mgr: &reference::ActorRef<OfiManagerActor>,
+        remote_buf_id: usize,
+        timeout: Duration,
+    ) -> Result<()> {
+        let local_mr = self.register_local_mr(local_addr, local_size)?;
+        let fi_addr = self.resolve_peer(cx, remote_mgr).await?;
+        let self_ref: reference::ActorRef<OfiManagerActor> = cx.bind();
+        let is_loopback = remote_mgr.actor_id() == self_ref.actor_id();
+        let timeout_ms = timeout.as_millis() as u64;
+
+        match op_type {
+            RdmaOpType::WriteFromLocal => {
+                // Sender pushes data via fi_send; remote posts fi_recv first.
+                if is_loopback {
+                    // Loopback: post fi_recv on our own buffer, then fi_send.
+                    let (dst_mr, dst_buf) = self
+                        .buffer_registrations
+                        .get(&remote_buf_id)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "loopback WriteFromLocal: buffer {} not registered",
+                                remote_buf_id,
+                            )
+                        })?;
+                    self.endpoint
+                        .recv(dst_buf.addr, local_size, dst_mr.desc(), fi_addr, ptr::null_mut())?;
+                } else {
+                    // Cross-actor: tell remote to post fi_recv into its buffer.
+                    remote_mgr
+                        .post_recv(cx, remote_buf_id, local_size, self_ref.clone(), timeout_ms)
+                        .await?
+                        .map_err(|e| anyhow::anyhow!(e))?;
+                }
+
+                // fi_send from local buffer + poll CQ for send completion.
+                self.post_and_poll_cq(
+                    || {
+                        self.endpoint
+                            .send(local_addr as u64, local_size, local_mr.desc(), fi_addr, ptr::null_mut())
+                    },
+                    timeout,
+                    "msg_send",
+                )
+                .await
+            }
+            RdmaOpType::ReadIntoLocal => {
+                // Post fi_recv locally, then ask remote to fi_send.
+                self.endpoint
+                    .recv(local_addr as u64, local_size, local_mr.desc(), fi_addr, ptr::null_mut())?;
+
+                if is_loopback {
+                    // Loopback: fi_send from our own buffer.
+                    let (src_mr, src_buf) = self
+                        .buffer_registrations
+                        .get(&remote_buf_id)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "loopback ReadIntoLocal: buffer {} not registered",
+                                remote_buf_id,
+                            )
+                        })?;
+                    // fi_send + poll CQ for send completion.
+                    self.post_and_poll_cq(
+                        || {
+                            self.endpoint.send(
+                                src_buf.addr,
+                                local_size,
+                                src_mr.desc(),
+                                fi_addr,
+                                ptr::null_mut(),
+                            )
+                        },
+                        timeout,
+                        "msg_send_loopback",
+                    )
+                    .await?;
+                } else {
+                    // Cross-actor: tell remote to fi_send from its buffer.
+                    remote_mgr
+                        .send_from_buffer(cx, remote_buf_id, local_size, self_ref.clone(), timeout_ms)
+                        .await?
+                        .map_err(|e| anyhow::anyhow!(e))?;
+                }
+
+                // Poll CQ for recv completion.
+                let _ops_guard = self.pause_cq_progress();
+                self.poll_cq_async(timeout).await
+            }
+        }
     }
 
     /// Construct an `ActorHandle` for the local `OfiManagerActor`.
@@ -445,7 +753,9 @@ impl OfiManagerMessageHandler for OfiManagerActor {
 
         let key = self.next_mr_key;
         self.next_mr_key += 1;
-        let mr = self.endpoint.register_mr(&self.domain, mem.addr(), mem.size(), key)?;
+        let mr = self
+            .endpoint
+            .register_mr(&self.domain, mem.addr(), mem.size(), key)?;
 
         let buf = OfiBuffer {
             rkey: mr.rkey,
@@ -453,7 +763,8 @@ impl OfiManagerMessageHandler for OfiManagerActor {
             size: mem.size(),
         };
 
-        self.buffer_registrations.insert(remote_buf_id, (mr, buf.clone()));
+        self.buffer_registrations
+            .insert(remote_buf_id, (mr, buf.clone()));
         Ok(Some(buf))
     }
 
@@ -472,6 +783,69 @@ impl OfiManagerMessageHandler for OfiManagerActor {
     ) -> Result<OfiEndpointInfo, anyhow::Error> {
         self.endpoint.get_name()
     }
+
+    async fn post_recv(
+        &mut self,
+        cx: &Context<Self>,
+        buf_id: usize,
+        size: usize,
+        sender: reference::ActorRef<OfiManagerActor>,
+        _timeout_ms: u64,
+    ) -> Result<Result<(), String>, anyhow::Error> {
+        // Resolve peer first (may mutate peer_addrs), then look up buffer.
+        let fi_addr = self.resolve_peer(cx, &sender).await?;
+
+        let (mr, buf) = self.buffer_registrations.get(&buf_id).ok_or_else(|| {
+            anyhow::anyhow!("PostRecv: buffer {} not registered", buf_id)
+        })?;
+
+        let recv_size = size.min(buf.size);
+        tracing::info!(buf_id, recv_size, fi_addr, "posting fi_recv for incoming data");
+
+        Ok(self
+            .endpoint
+            .recv(buf.addr, recv_size, mr.desc(), fi_addr, ptr::null_mut())
+            .map_err(|e| e.to_string()))
+    }
+
+    async fn send_from_buffer(
+        &mut self,
+        cx: &Context<Self>,
+        buf_id: usize,
+        size: usize,
+        dest: reference::ActorRef<OfiManagerActor>,
+        timeout_ms: u64,
+    ) -> Result<Result<(), String>, anyhow::Error> {
+        // Resolve peer first (may mutate peer_addrs), then look up buffer.
+        let fi_addr = self.resolve_peer(cx, &dest).await?;
+
+        let (mr, buf) = self.buffer_registrations.get(&buf_id).ok_or_else(|| {
+            anyhow::anyhow!("SendFromBuffer: buffer {} not registered", buf_id)
+        })?;
+
+        let send_size = size.min(buf.size);
+        let send_addr = buf.addr;
+        // Store desc as usize to avoid holding a non-Send *mut c_void across await.
+        let send_desc = mr.desc() as usize;
+        tracing::info!(buf_id, send_size, fi_addr, "fi_send from buffer to remote");
+
+        Ok(self
+            .post_and_poll_cq(
+                || {
+                    self.endpoint.send(
+                        send_addr,
+                        send_size,
+                        send_desc as *mut std::ffi::c_void,
+                        fi_addr,
+                        ptr::null_mut(),
+                    )
+                },
+                Duration::from_millis(timeout_ms),
+                "msg_send_from_buffer",
+            )
+            .await
+            .map_err(|e| e.to_string()))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -489,6 +863,7 @@ impl OfiManagerLocalMessageHandler for OfiManagerActor {
         local_size: usize,
         remote_ofi_mgr: reference::ActorRef<OfiManagerActor>,
         remote_buffer: OfiBuffer,
+        remote_buf_id: usize,
         timeout_ms: u64,
     ) -> Result<Result<(), String>, anyhow::Error> {
         Ok(self
@@ -499,6 +874,7 @@ impl OfiManagerLocalMessageHandler for OfiManagerActor {
                 local_size,
                 &remote_ofi_mgr,
                 &remote_buffer,
+                remote_buf_id,
                 Duration::from_millis(timeout_ms),
             )
             .await
@@ -546,6 +922,7 @@ impl RdmaBackend for OfiBackend {
                 .ok_or_else(|| anyhow::anyhow!("OFI backend not found for remote buffer"))??;
 
             // Execute via local actor message (endpoint is not thread-safe)
+            let remote_buf_id = op.remote.id;
             self.execute_op(
                 cx,
                 op.op_type,
@@ -553,6 +930,7 @@ impl RdmaBackend for OfiBackend {
                 op.local.size(),
                 remote_ofi_mgr,
                 remote_ofi_buf,
+                remote_buf_id,
                 remaining.as_millis() as u64,
             )
             .await?

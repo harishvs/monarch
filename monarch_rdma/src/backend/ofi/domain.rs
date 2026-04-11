@@ -30,6 +30,8 @@ pub struct OfiDomain {
     pub cq: *mut libfabric_sys::fid_cq,
     /// Whether the provider supports heterogeneous memory (e.g., CUDA GPU buffers).
     pub hmem_supported: bool,
+    /// Whether the provider supports RMA (fi_read/fi_write). False on P4d (Nitro v3).
+    pub rma_supported: bool,
 }
 
 // Safety: OfiDomain is only accessed from the OfiManagerActor which is
@@ -59,21 +61,16 @@ impl OfiDomain {
     /// If the provider does not support HMEM, falls back to CPU-only mode.
     pub fn new(config: &OfiConfig) -> Result<Self> {
         unsafe {
-            // Try with HMEM first (if requested), fall back to without
-            let (info, hmem_supported) = if config.request_hmem {
-                Self::get_info_with_hmem_fallback(config)?
-            } else {
-                let info = Self::call_fi_getinfo(config, false)?;
-                (info, false)
-            };
+            // Negotiate capabilities with fallbacks:
+            // 1. Try FI_RMA | FI_MSG (+ FI_HMEM if requested)
+            // 2. Fall back to FI_MSG only (+ FI_HMEM fallback)
+            // This handles P4d (Nitro v3) which doesn't advertise FI_RMA.
+            let (info, hmem_supported, rma_supported) =
+                Self::negotiate_capabilities(config)?;
 
             // fi_fabric
             let mut fabric: *mut libfabric_sys::fid_fabric = ptr::null_mut();
-            let ret = libfabric_sys::fi_fabric(
-                (*info).fabric_attr,
-                &mut fabric,
-                ptr::null_mut(),
-            );
+            let ret = libfabric_sys::fi_fabric((*info).fabric_attr, &mut fabric, ptr::null_mut());
             if ret != 0 {
                 libfabric_sys::fi_freeinfo(info);
                 anyhow::bail!("fi_fabric failed: {}", ofi_strerror(ret));
@@ -81,12 +78,8 @@ impl OfiDomain {
 
             // fi_domain
             let mut domain: *mut libfabric_sys::fid_domain = ptr::null_mut();
-            let ret = libfabric_sys::libfabric_sys_fi_domain(
-                fabric,
-                info,
-                &mut domain,
-                ptr::null_mut(),
-            );
+            let ret =
+                libfabric_sys::libfabric_sys_fi_domain(fabric, info, &mut domain, ptr::null_mut());
             if ret != 0 {
                 libfabric_sys::libfabric_sys_fi_close(&mut (*fabric).fid);
                 libfabric_sys::fi_freeinfo(info);
@@ -136,30 +129,56 @@ impl OfiDomain {
                 av,
                 cq,
                 hmem_supported,
+                rma_supported,
             })
         }
     }
 
-    /// Attempt `fi_getinfo` with `FI_HMEM` capability; fall back to
-    /// CPU-only if the provider does not support it.
-    unsafe fn get_info_with_hmem_fallback(
+    /// Negotiate the best available capabilities with the provider.
+    ///
+    /// Tries progressively fewer capabilities until a working combination
+    /// is found. Returns `(info, hmem_supported, rma_supported)`.
+    ///
+    /// Priority order:
+    /// 1. FI_RMA | FI_MSG | FI_HMEM  (best: RMA + GPU)
+    /// 2. FI_RMA | FI_MSG            (RMA, CPU-only)
+    /// 3. FI_MSG | FI_HMEM           (messaging + GPU, no RMA — P4d with GPU)
+    /// 4. FI_MSG                     (messaging only — P4d CPU-only)
+    unsafe fn negotiate_capabilities(
         config: &OfiConfig,
-    ) -> Result<(*mut libfabric_sys::fi_info, bool)> {
-        // First try with FI_HMEM
-        if let Ok(info) = Self::call_fi_getinfo(config, true) {
-            tracing::info!("OFI provider supports FI_HMEM (GPU memory)");
-            return Ok((info, true));
+    ) -> Result<(*mut libfabric_sys::fi_info, bool, bool)> {
+        // Try with RMA first
+        if config.request_hmem {
+            if let Ok(info) = Self::call_fi_getinfo(config, true, true) {
+                tracing::info!("OFI provider supports FI_RMA + FI_HMEM");
+                return Ok((info, true, true));
+            }
+        }
+        if let Ok(info) = Self::call_fi_getinfo(config, true, false) {
+            tracing::info!(
+                "OFI provider supports FI_RMA{}",
+                if config.request_hmem { " (no FI_HMEM)" } else { "" },
+            );
+            return Ok((info, false, true));
         }
 
-        // Fall back to non-HMEM
-        let info = Self::call_fi_getinfo(config, false)?;
-        tracing::info!("OFI provider does not support FI_HMEM, using CPU-only mode");
-        Ok((info, false))
+        // Fall back to messaging only (no RMA) — P4d (Nitro v3)
+        tracing::info!("OFI provider does not support FI_RMA, using messaging path");
+        if config.request_hmem {
+            if let Ok(info) = Self::call_fi_getinfo(config, false, true) {
+                tracing::info!("OFI messaging path with FI_HMEM (GPU)");
+                return Ok((info, true, false));
+            }
+        }
+        let info = Self::call_fi_getinfo(config, false, false)?;
+        tracing::info!("OFI messaging path, CPU-only");
+        Ok((info, false, false))
     }
 
     /// Build hints and call `fi_getinfo`.
     unsafe fn call_fi_getinfo(
         config: &OfiConfig,
+        request_rma: bool,
         request_hmem: bool,
     ) -> Result<*mut libfabric_sys::fi_info> {
         let hints = libfabric_sys::fi_allocinfo();
@@ -168,7 +187,10 @@ impl OfiDomain {
         }
 
         (*(*hints).ep_attr).type_ = libfabric_sys::fi_ep_type_FI_EP_RDM;
-        let mut caps = libfabric_sys::FI_RMA as u64 | libfabric_sys::FI_MSG as u64;
+        let mut caps = libfabric_sys::FI_MSG as u64;
+        if request_rma {
+            caps |= libfabric_sys::FI_RMA as u64;
+        }
         if request_hmem {
             caps |= libfabric_sys::FI_HMEM as u64;
         }
@@ -196,9 +218,10 @@ impl OfiDomain {
 
         if ret != 0 || info.is_null() {
             anyhow::bail!(
-                "fi_getinfo failed: {} (provider: {:?}, hmem: {})",
+                "fi_getinfo failed: {} (provider: {:?}, rma: {}, hmem: {})",
                 ofi_strerror(ret),
                 config.provider,
+                request_rma,
                 request_hmem,
             );
         }
@@ -238,9 +261,7 @@ fn ofi_strerror(err: i32) -> String {
         if ptr.is_null() {
             format!("unknown error ({})", err)
         } else {
-            std::ffi::CStr::from_ptr(ptr)
-                .to_string_lossy()
-                .into_owned()
+            std::ffi::CStr::from_ptr(ptr).to_string_lossy().into_owned()
         }
     }
 }

@@ -6,7 +6,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! OFI endpoint — create, bind, enable, and perform RDMA read/write.
+//! OFI endpoint — create, bind, enable, and perform RDMA and messaging ops.
 
 use std::ptr;
 use std::time::Duration;
@@ -28,9 +28,7 @@ unsafe impl Sync for OfiEndpoint {}
 
 impl std::fmt::Debug for OfiEndpoint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OfiEndpoint")
-            .field("ep", &self.ep)
-            .finish()
+        f.debug_struct("OfiEndpoint").field("ep", &self.ep).finish()
     }
 }
 
@@ -53,24 +51,15 @@ impl OfiEndpoint {
             }
 
             // Bind AV
-            let ret = libfabric_sys::libfabric_sys_fi_ep_bind(
-                ep,
-                &mut (*domain.av).fid,
-                0,
-            );
+            let ret = libfabric_sys::libfabric_sys_fi_ep_bind(ep, &mut (*domain.av).fid, 0);
             if ret != 0 {
                 libfabric_sys::libfabric_sys_fi_close(&mut (*ep).fid);
                 anyhow::bail!("fi_ep_bind(av) failed: {}", ret);
             }
 
             // Bind CQ for both send and recv completions
-            let cq_flags = libfabric_sys::FI_TRANSMIT as u64
-                | libfabric_sys::FI_RECV as u64;
-            let ret = libfabric_sys::libfabric_sys_fi_ep_bind(
-                ep,
-                &mut (*domain.cq).fid,
-                cq_flags,
-            );
+            let cq_flags = libfabric_sys::FI_TRANSMIT as u64 | libfabric_sys::FI_RECV as u64;
+            let ret = libfabric_sys::libfabric_sys_fi_ep_bind(ep, &mut (*domain.cq).fid, cq_flags);
             if ret != 0 {
                 libfabric_sys::libfabric_sys_fi_close(&mut (*ep).fid);
                 anyhow::bail!("fi_ep_bind(cq) failed: {}", ret);
@@ -108,10 +97,7 @@ impl OfiEndpoint {
                 anyhow::bail!("fi_getname failed: {}", ret);
             }
 
-            Ok(OfiEndpointInfo {
-                addr,
-                addr_len,
-            })
+            Ok(OfiEndpointInfo { addr, addr_len })
         }
     }
 
@@ -158,9 +144,9 @@ impl OfiEndpoint {
                     | libfabric_sys::FI_REMOTE_WRITE
                     | libfabric_sys::FI_READ
                     | libfabric_sys::FI_WRITE) as u64,
-                0,    // offset
-                key,  // requested_key
-                0,    // flags
+                0,   // offset
+                key, // requested_key
+                0,   // flags
                 &mut mr,
                 ptr::null_mut(),
             );
@@ -206,12 +192,7 @@ impl OfiEndpoint {
             attr.device.cuda = device_ordinal;
 
             let mut mr: *mut libfabric_sys::fid_mr = ptr::null_mut();
-            let ret = libfabric_sys::libfabric_sys_fi_mr_regattr(
-                domain.domain,
-                &attr,
-                0,
-                &mut mr,
-            );
+            let ret = libfabric_sys::libfabric_sys_fi_mr_regattr(domain.domain, &attr, 0, &mut mr);
             if ret != 0 {
                 anyhow::bail!(
                     "fi_mr_regattr failed: {} (iface={}, device={})",
@@ -255,6 +236,63 @@ impl OfiEndpoint {
         }
     }
 
+    /// Send data to a peer via messaging (fi_send).
+    ///
+    /// Used on providers without RMA support (e.g., EFA on P4d / Nitro v3).
+    /// The peer must have a matching fi_recv posted.
+    pub fn send(
+        &self,
+        local_addr: u64,
+        local_len: usize,
+        local_mr_desc: *mut std::ffi::c_void,
+        peer: libfabric_sys::fi_addr_t,
+        context: *mut std::ffi::c_void,
+    ) -> Result<()> {
+        unsafe {
+            let ret = libfabric_sys::libfabric_sys_fi_send(
+                self.ep,
+                local_addr as *const _,
+                local_len,
+                local_mr_desc,
+                peer,
+                context,
+            );
+            if ret != 0 {
+                anyhow::bail!("fi_send failed: {}", ret);
+            }
+            Ok(())
+        }
+    }
+
+    /// Post a receive buffer for incoming data from a peer (fi_recv).
+    ///
+    /// Used on providers without RMA support. Specify the expected
+    /// `src_addr` (peer's fi_addr_t) to filter messages from that peer,
+    /// or `FI_ADDR_UNSPEC` to accept from any.
+    pub fn recv(
+        &self,
+        local_addr: u64,
+        local_len: usize,
+        local_mr_desc: *mut std::ffi::c_void,
+        src_addr: libfabric_sys::fi_addr_t,
+        context: *mut std::ffi::c_void,
+    ) -> Result<()> {
+        unsafe {
+            let ret = libfabric_sys::libfabric_sys_fi_recv(
+                self.ep,
+                local_addr as *mut _,
+                local_len,
+                local_mr_desc,
+                src_addr,
+                context,
+            );
+            if ret != 0 {
+                anyhow::bail!("fi_recv failed: {}", ret);
+            }
+            Ok(())
+        }
+    }
+
     /// Perform an RDMA read (remote → local).
     pub fn read(
         &self,
@@ -286,11 +324,7 @@ impl OfiEndpoint {
 
     /// Poll the CQ for completions, blocking until at least one arrives
     /// or the timeout expires.
-    pub fn poll_cq(
-        &self,
-        domain: &OfiDomain,
-        timeout: Duration,
-    ) -> Result<()> {
+    pub fn poll_cq(&self, domain: &OfiDomain, timeout: Duration) -> Result<()> {
         let deadline = Instant::now() + timeout;
         loop {
             let mut entry: libfabric_sys::fi_cq_data_entry = unsafe { std::mem::zeroed() };
@@ -313,14 +347,9 @@ impl OfiEndpoint {
                 continue;
             } else {
                 // Error — read the error entry for details
-                let mut err_entry: libfabric_sys::fi_cq_err_entry =
-                    unsafe { std::mem::zeroed() };
+                let mut err_entry: libfabric_sys::fi_cq_err_entry = unsafe { std::mem::zeroed() };
                 let readerr_ret = unsafe {
-                    libfabric_sys::libfabric_sys_fi_cq_readerr(
-                        domain.cq,
-                        &mut err_entry,
-                        0,
-                    )
+                    libfabric_sys::libfabric_sys_fi_cq_readerr(domain.cq, &mut err_entry, 0)
                 };
 
                 let prov_str = if readerr_ret > 0 {
@@ -334,15 +363,16 @@ impl OfiEndpoint {
                             buf.len(),
                         );
                         if !msg.is_null() {
-                            std::ffi::CStr::from_ptr(msg)
-                                .to_string_lossy()
-                                .into_owned()
+                            std::ffi::CStr::from_ptr(msg).to_string_lossy().into_owned()
                         } else {
                             format!("prov_errno={}", err_entry.prov_errno)
                         }
                     }
                 } else {
-                    format!("prov_errno={} (fi_cq_readerr={})", err_entry.prov_errno, readerr_ret)
+                    format!(
+                        "prov_errno={} (fi_cq_readerr={})",
+                        err_entry.prov_errno, readerr_ret
+                    )
                 };
 
                 tracing::error!(

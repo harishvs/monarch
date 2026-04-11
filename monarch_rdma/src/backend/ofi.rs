@@ -23,10 +23,10 @@ pub mod primitives;
 use std::sync::Arc;
 
 use hyperactor::reference;
+use manager_actor::OfiManagerActor;
 
 use crate::RdmaOpType;
 use crate::local_memory::RdmaLocalMemory;
-use manager_actor::OfiManagerActor;
 
 /// Serializable description of a remote buffer registered via OFI.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, typeuri::Named)]

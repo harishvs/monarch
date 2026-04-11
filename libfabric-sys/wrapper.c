@@ -132,6 +132,22 @@ void *libfabric_sys_fi_mr_desc(struct fid_mr *mr)
     return fi_mr_desc(mr);
 }
 
+/* --- Messaging (fi_send/fi_recv) ---------------------------------------- */
+
+ssize_t libfabric_sys_fi_send(
+    struct fid_ep *ep, const void *buf, size_t len, void *desc,
+    fi_addr_t dest_addr, void *context)
+{
+    return fi_send(ep, buf, len, desc, dest_addr, context);
+}
+
+ssize_t libfabric_sys_fi_recv(
+    struct fid_ep *ep, void *buf, size_t len, void *desc,
+    fi_addr_t src_addr, void *context)
+{
+    return fi_recv(ep, buf, len, desc, src_addr, context);
+}
+
 /* --- RMA (RDMA read/write) --------------------------------------------- */
 
 ssize_t libfabric_sys_fi_write(
